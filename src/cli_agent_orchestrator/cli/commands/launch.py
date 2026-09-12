@@ -71,6 +71,33 @@ def _parse_env_pairs(pairs):
         raise click.ClickException(f"--{exc}") from exc
 
 
+def _deliver_initial_message(terminal, message):
+    """Wait for a newly-created terminal, then deliver its initial message.
+
+    A launch message must not be sent while the provider is still wiring its
+    input handler. Keeping this delivery sequence in one helper makes the
+    attached and detached launch paths use the same readiness guarantee.
+    """
+    ready = wait_until_terminal_status(
+        terminal["id"],
+        {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+        timeout=120,
+    )
+    if not ready:
+        raise click.ClickException(
+            f"Conductor {terminal['id']} did not become ready; the provider may be in "
+            "ERROR or still initializing"
+        )
+
+    request_timeout = get_server_settings()["mcp_request_timeout"]
+    response = requests.post(
+        f"{API_BASE_URL}/terminals/{terminal['id']}/input",
+        params={"message": message},
+        timeout=request_timeout,
+    )
+    response.raise_for_status()
+
+
 @click.command()
 @click.argument("message", required=False, default=None)
 @click.option("--agents", required=True, help="Agent profile to launch")
@@ -155,7 +182,12 @@ def launch(
     env_pairs,
     resume_session_id,
 ):
-    """Launch cao session with specified agent profile."""
+    """Launch a CAO session with the specified agent profile.
+
+    A positional MESSAGE is delivered before attaching when neither
+    ``--headless`` nor ``--async`` is used. ``--async`` always treats a
+    provided MESSAGE as detached delivery and returns without attaching.
+    """
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
@@ -261,10 +293,11 @@ def launch(
                         "  Add 'role' or 'allowedTools' to your agent profile to control tool access.\n"
                         "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
                     )
-                click.echo(
-                    "  To skip this prompt next time, relaunch with --auto-approve\n"
-                    "  To remove all restrictions, relaunch with --yolo\n"
-                )
+                if auto_approve:
+                    click.echo("  Launch confirmation auto-approved (--auto-approve)\n")
+                else:
+                    click.echo("  To skip this prompt next time, relaunch with --auto-approve\n")
+                click.echo("  To remove all restrictions, relaunch with --yolo\n")
                 if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 
@@ -305,52 +338,20 @@ def launch(
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
 
-        # Attach to tmux session unless headless. Wait for the provider to
-        # finish initializing first — otherwise tmux attach races with the
-        # TUI's input handler wiring, resizes the pty mid-init, and the TUI
-        # silently drops keystrokes. See issue #220. The wait is advisory:
-        # if it times out we still attach so the user can inspect the
-        # half-initialized session rather than orphan it in tmux.
-        if not headless:
-            # Align the CLI's backend singleton with the running server.
-            # Without this, ``cao-server --terminal herdr`` + no config.json
-            # entry causes the CLI to default to tmux. See issue #308.
-            sync_backend_from_server()
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                click.echo(
-                    click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
-                        fg="yellow",
-                    )
-                )
-            get_backend().attach_session(terminal["session_name"])
-        elif message:
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
-                )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/input",
-                params={"message": message},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            time.sleep(3)
+        initial_message_delivered = False
+        # A message is an explicit request for delivery, even when it is an
+        # empty string. In detached mode, --async supplies the detached
+        # behavior by itself; --headless remains an equivalent explicit mode.
+        # In the ordinary attached mode, send before attach so a positional
+        # message is never silently discarded.
+        if message is not None and (headless or is_async):
+            _deliver_initial_message(terminal, message)
             if is_async:
+                time.sleep(3)
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
+
+            time.sleep(3)
             poll_until_done(terminal["id"], timeout=300)
             request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
@@ -362,6 +363,39 @@ def launch(
             output = output_resp.json().get("output", "")
             if output:
                 click.echo(output)
+            return
+
+        if message is not None:
+            _deliver_initial_message(terminal, message)
+            initial_message_delivered = True
+
+        # Attach to tmux session unless headless. Wait for the provider to
+        # finish initializing first — otherwise tmux attach races with the
+        # TUI's input handler wiring, resizes the pty mid-init, and the TUI
+        # silently drops keystrokes. See issue #220. The wait is advisory:
+        # if it times out we still attach so the user can inspect the
+        # half-initialized session rather than orphan it in tmux.
+        if not headless:
+            # Align the CLI's backend singleton with the running server.
+            # Without this, ``cao-server --terminal herdr`` + no config.json
+            # entry causes the CLI to default to tmux. See issue #308.
+            sync_backend_from_server()
+            if not initial_message_delivered:
+                ready = wait_until_terminal_status(
+                    terminal["id"],
+                    {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                    timeout=120,
+                )
+                if not ready:
+                    click.echo(
+                        click.style(
+                            f"  Warning: {terminal['id']} did not reach idle; the provider may "
+                            "be in ERROR or still initializing — attaching anyway; input may "
+                            "be unreliable until init completes.",
+                            fg="yellow",
+                        )
+                    )
+            get_backend().attach_session(terminal["session_name"])
 
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")

@@ -201,6 +201,104 @@ def test_launch_headless_message_sends_to_terminal():
         assert mock_post.call_count == 2
 
 
+def test_launch_async_message_is_detached_without_headless():
+    """Async messages are delivered through the terminal input endpoint without attach."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--yolo", "--async", "do something"],
+        )
+
+        assert result.exit_code == 0
+        assert "Message sent to test-terminal. Running in background." in result.output
+        mock_wait.assert_called_once()
+        mock_get_backend.return_value.attach_session.assert_not_called()
+        assert mock_post.call_count == 2
+        assert mock_post.call_args_list[1].kwargs["params"] == {"message": "do something"}
+
+
+def test_launch_message_readiness_error_does_not_claim_timeout():
+    """A failed readiness status is not reported as a 120-second timeout."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = False
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--yolo", "--async", "do something"],
+        )
+
+        assert result.exit_code != 0
+        assert "did not become ready; the provider may be in ERROR" in result.output
+        assert "did not become ready within 120s" not in result.output
+        mock_post.assert_called_once()
+
+
+def test_launch_message_without_detached_flags_sends_before_attach():
+    """An attached positional message is delivered before the tmux attach."""
+    runner = CliRunner()
+    call_order = []
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
+    ):
+        response = MagicMock()
+        response.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        response.raise_for_status.return_value = None
+
+        def record_post(*args, **kwargs):
+            call_order.append("send" if "message" in kwargs["params"] else "create")
+            return response
+
+        mock_post.side_effect = record_post
+        mock_wait.side_effect = lambda *args, **kwargs: call_order.append("wait") or True
+        mock_sync.side_effect = lambda: call_order.append("sync")
+        mock_get_backend.return_value.attach_session.side_effect = (
+            lambda *args, **kwargs: call_order.append("attach")
+        )
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--yolo", "do something"],
+        )
+
+        assert result.exit_code == 0
+        assert call_order == ["create", "wait", "send", "sync", "attach"]
+        assert mock_post.call_args_list[1].kwargs["params"] == {"message": "do something"}
+
+
 def test_launch_invalid_provider():
     """Test launch with invalid provider."""
     runner = CliRunner()
@@ -356,7 +454,8 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code == 0
-        assert "did not reach idle within 120s" in result.output
+        assert "did not reach idle; the provider may be in ERROR" in result.output
+        assert "did not reach idle within 120s" not in result.output
         mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
 
 
@@ -425,6 +524,38 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
         assert "Proceed?" not in result.output
         assert "WARNING" in result.output
         mock_post.assert_called_once()
+
+
+def test_launch_auto_approve_output_does_not_repeat_skip_guidance():
+    """Auto-approved launches do not claim that --auto-approve was omitted."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--provider",
+                "claude_code",
+                "--headless",
+                "--auto-approve",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "Launch confirmation auto-approved (--auto-approve)" in result.output
+        assert "To skip this prompt next time" not in result.output
+        assert "Proceed?" not in result.output
 
 
 def test_launch_workspace_confirmation_for_default_provider():

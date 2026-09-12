@@ -194,6 +194,10 @@ async def wait_until_status(
     status_monitor.py), and on herdr it shells out to the herdr CLI. Offload each poll via
     asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop —
     matches the pattern GET /terminals/{id} (api/main.py) uses for the identical hazard.
+
+    A terminal that reports ERROR is terminal for a readiness wait and returns
+    immediately instead of consuming the full timeout. Callers can then surface
+    the provider failure while the terminal status remains available for inspection.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -208,6 +212,12 @@ async def wait_until_status(
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
+        if current == TerminalStatus.ERROR:
+            logger.warning(
+                f"wait_until_status [{terminal_id}]: terminal reported ERROR before "
+                "reaching a ready status"
+            )
+            return False
         await asyncio.sleep(polling_interval)
     logger.warning(f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}")
     return False
@@ -376,6 +386,15 @@ def wait_until_terminal_status(
                         f"({time.time() - start_time:.1f}s)"
                     )
                     return True
+                if (
+                    current_status == TerminalStatus.ERROR.value
+                    and TerminalStatus.ERROR.value not in target_values
+                ):
+                    logger.warning(
+                        f"wait_until_terminal_status [{terminal_id}]: terminal reported "
+                        "ERROR before reaching a ready status"
+                    )
+                    return False
         except Exception as e:
             logger.debug(
                 f"wait_until_terminal_status [{terminal_id}] poll #{poll_count} error: {e}"

@@ -289,6 +289,19 @@ class TestWaitUntilStatus:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_stops_when_terminal_errors(self, mock_monitor):
+        """A provider error ends a readiness wait without burning the timeout."""
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=10.0, polling_interval=0.1
+        )
+
+        assert result is False
+        mock_monitor.get_status.assert_called_once_with("test-terminal")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     async def test_wait_until_status_with_set(self, mock_monitor):
         """Test status wait accepts a set of target statuses."""
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
@@ -368,6 +381,21 @@ class TestWaitUntilTerminalStatus:
         )
 
         assert result is False
+
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    def test_wait_until_terminal_status_stops_when_terminal_errors(self, mock_get):
+        """A provider error ends an API readiness wait without burning the timeout."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": TerminalStatus.ERROR.value}
+        mock_get.return_value = mock_response
+
+        result = wait_until_terminal_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=10.0, polling_interval=0.1
+        )
+
+        assert result is False
+        mock_get.assert_called_once()
 
     @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_api_error(self, mock_get):

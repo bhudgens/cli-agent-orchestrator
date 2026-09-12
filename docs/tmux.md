@@ -75,6 +75,14 @@ The same three rules are enforced at the tool boundary — blocked
 of vanishing. The CLI and the ops-MCP tool share one validator
 (`utils/forwarded_env.py`) so the two paths cannot drift.
 
+## Launch messages
+
+When `MESSAGE` is supplied to `cao launch`, it is delivered after the new
+terminal reports readiness. An ordinary attached launch sends the message
+before attaching, while `--headless MESSAGE` waits for the response and
+`--async MESSAGE` sends it and returns in the background without requiring
+`--headless`. A supplied message is never silently discarded.
+
 ## Notes
 
 - CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`.

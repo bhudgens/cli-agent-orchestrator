@@ -63,6 +63,34 @@ IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
+# Codex can accept an invalid model slug far enough to render its normal
+# startup banner, then reject the model only after the first prompt. These
+# provider-specific messages are terminal failures, not ordinary assistant
+# prose, and must win over the idle-composer check below. Keep the model name
+# bounded and quote-delimited so a malformed pane cannot make this detector
+# backtrack across the whole rolling buffer.
+CODEX_MODEL_ERROR_PATTERN = (
+    r"^[ \t]*(?:Model\s+metadata\s+for\s+['\"][^'\"\n]{1,128}['\"]\s+not\s+found\."
+    r"|The\s+['\"][^'\"\n]{1,128}['\"]\s+model\s+is\s+not\s+supported\s+when\s+using\s+Codex\s+"
+    r"with\s+a\s+ChatGPT\s+account\.)"
+)
+
+
+def _has_codex_model_error(output: str) -> bool:
+    """Return whether output contains a provider-level model rejection.
+
+    Rendered Codex screens may wrap one logical sentence across rows and may
+    prefix an error row with a status glyph such as ``■``. Collapse those
+    presentation details before matching the bounded, distinctive provider
+    wording. Callers still apply the assistant-response guard so quoted error
+    text is treated as prose rather than a terminal failure.
+    """
+    normalized_output = re.sub(r"(?m)^[ \t]*■[ \t]*", "", output)
+    return (
+        re.search(CODEX_MODEL_ERROR_PATTERN, normalized_output, re.IGNORECASE | re.MULTILINE)
+        is not None
+    )
+
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
@@ -1320,6 +1348,7 @@ class CodexProvider(BaseProvider):
         assistant_after_last_user = bool(
             last_user and _find_assistant_marker(output_after_last_user) is not None
         )
+        assistant_in_tail = _find_assistant_marker(tail_output) is not None
 
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
         # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
@@ -1406,6 +1435,8 @@ class CodexProvider(BaseProvider):
         # and are not part of an assistant response.
         if last_user is not None:
             if not assistant_after_last_user:
+                if _has_codex_model_error(output_after_last_user):
+                    return TerminalStatus.ERROR
                 if re.search(
                     WAITING_PROMPT_PATTERN,
                     output_after_last_user,
@@ -1419,6 +1450,15 @@ class CodexProvider(BaseProvider):
                 ):
                     return TerminalStatus.ERROR
         else:
+            # A rendered viewport can retain an assistant bullet after the user
+            # marker has scrolled away. In that case, an otherwise exact model
+            # rejection sentence may be quoted prose from the healthy reply.
+            # Genuine no-user provider errors remain column-zero (or use the
+            # square decorator normalized by _has_codex_model_error), so only
+            # suppress the model-specific check when assistant prose is present
+            # in the same tail region.
+            if not assistant_in_tail and _has_codex_model_error(tail_output):
+                return TerminalStatus.ERROR
             if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
                 return TerminalStatus.WAITING_USER_ANSWER
             if re.search(ERROR_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
