@@ -7,7 +7,10 @@ import pytest
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.mcp_server.server import _build_assign_description
-from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
+from cli_agent_orchestrator.utils.orchestration import (
+    _ASSIGN_VERIFIED_CREATE_TIMEOUT_S,
+    _mcp_timeout,
+)
 
 
 class TestCreateTerminalProviderResolution:
@@ -320,6 +323,45 @@ class TestCreateTerminalProviderResolution:
 
         assert mock_requests.get.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
         assert mock_requests.post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_existing_session_inherits_supervisor_working_directory_when_omitted(
+        self, mock_requests, _mock_resolve_provider, _mock_allowed_tools
+    ):
+        """Regression: server cwd B must not leak into assign workers when the
+        supervisor pane is in cwd A and assign does not pass an explicit cwd."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "codex",
+            "session_name": "cao-session-a",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        cwd_response = MagicMock()
+        cwd_response.status_code = 200
+        cwd_response.json.return_value = {
+            "working_directory": "/Users/benjamin.hudgens/reverts/project-a"
+        }
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-a", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.side_effect = [metadata_response, cwd_response]
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            terminal_id, provider = _create_terminal("developer")
+
+        assert (terminal_id, provider) == ("worker-a", "codex")
+        params = mock_requests.post.call_args.kwargs["params"]
+        assert params["working_directory"] == "/Users/benjamin.hudgens/reverts/project-a"
+        assert params["caller_id"] == "a1b2c3d4"
 
 
 class TestCreateTerminalModelOverride:
@@ -808,9 +850,9 @@ class TestAssignSenderIdInjection:
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_assign_returns_fast_success_message(self, mock_create, _nudge):
-        """Regression: assign() should tell the LLM the worker is initializing
-        in the background, not claim the message has been delivered."""
+    def test_assign_returns_verified_delivery_message(self, mock_create, _nudge):
+        """assign() should only report success after the server verifies that
+        the worker accepted the initial task."""
         from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-fast", "kiro_cli")
@@ -820,9 +862,9 @@ class TestAssignSenderIdInjection:
 
         assert result["success"] is True
         assert result["terminal_id"] == "worker-fast"
-        # The message must reflect deferred delivery so the LLM does not
-        # falsely conclude the worker has already received the task.
-        assert "initializing" in result["message"].lower()
+        assert "accepted the initial task" in result["message"]
+        assert mock_create.call_args.kwargs["verify_initial_delivery"] is True
+        assert mock_create.call_args.kwargs["create_timeout"] == _ASSIGN_VERIFIED_CREATE_TIMEOUT_S
 
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")

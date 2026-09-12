@@ -3173,6 +3173,7 @@ async def create_terminal_in_session(
     engine: Optional[KiroEngine] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    verify_initial_delivery: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
@@ -3194,6 +3195,11 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``verify_initial_delivery=true`` keeps the deferred create call open until
+    provider initialization, cwd verification, and initial-message pickup have
+    succeeded. It is intended for assign/handoff startup guarantees where the
+    caller needs a visible failure instead of a later background notification.
 
     ``model``: optional explicit override, applied ahead of the agent
     profile's own static ``model`` field (where the resolved provider
@@ -3284,6 +3290,7 @@ async def create_terminal_in_session(
             registry=get_plugin_registry(request),
             caller_id=caller_id,
             defer_init=defer_init,
+            verify_initial_delivery=verify_initial_delivery,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
             engine=engine,

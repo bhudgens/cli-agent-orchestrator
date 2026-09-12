@@ -390,6 +390,70 @@ class TestHappyPath:
         assert m_create.await_args.kwargs["new_session"] is False
         assert m_create.await_args.kwargs["session_name"] == "cao-sup"
 
+    def test_created_terminal_requests_cwd_verification(self):
+        """Fresh run-step/handoff workers must fail visibly if tmux starts the
+        pane in a stale server cwd instead of the resolved supervisor cwd."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    session_name="cao-sup",
+                    working_directory="/repo-a",
+                    caller_id="a1b2c3d4",
+                )
+            )
+        assert m_create.await_args.kwargs["new_session"] is False
+        assert m_create.await_args.kwargs["session_name"] == "cao-sup"
+        assert m_create.await_args.kwargs["working_directory"] == "/repo-a"
+        assert m_create.await_args.kwargs["verify_initial_delivery"] is True
+
+    def test_create_cwd_verification_failure_is_visible_before_prompt_send(self):
+        """The run-step caller sees terminal creation/cwd verification failure,
+        and the task prompt is not sent to the wrong directory."""
+        create = patch(
+            f"{_MODULE}.terminal_service.create_terminal",
+            new=AsyncMock(
+                side_effect=RuntimeError(
+                    "worker cwd verification failed: expected '/repo-a', got '/repo-b'"
+                )
+            ),
+        )
+        send = patch(f"{_MODULE}.terminal_service.send_input", return_value=True)
+        delete = patch(f"{_MODULE}.terminal_service.delete_terminal", return_value=True)
+        get_output = patch(f"{_MODULE}.terminal_service.get_output", return_value="the answer")
+        exit_cli = patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None)
+        wait = patch(f"{_MODULE}.wait_until_status", new=AsyncMock(return_value=True))
+        status = patch(f"{_MODULE}.status_monitor.get_status", return_value=TerminalStatus.COMPLETED)
+
+        with (
+            create as m_create,
+            send as m_send,
+            delete as m_delete,
+            get_output,
+            exit_cli,
+            wait as m_wait,
+            status,
+            pytest.raises(RuntimeError, match="worker cwd verification failed"),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    session_name="cao-sup",
+                    working_directory="/repo-a",
+                    caller_id="a1b2c3d4",
+                )
+            )
+
+        assert m_create.await_args.kwargs["verify_initial_delivery"] is True
+        m_send.assert_not_called()
+        m_wait.assert_not_awaited()
+        m_delete.assert_not_called()
+
     def test_caller_id_and_allowed_tools_forwarded_to_create(self):
         """caller_id (#284 callback routing) and inherited allowed_tools must
         reach create_terminal for handoff workers."""
