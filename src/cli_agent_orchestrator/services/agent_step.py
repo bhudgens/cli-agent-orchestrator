@@ -232,7 +232,13 @@ async def _wait_for_completion(
                 terminal_id=terminal_id,
             )
         if current == TerminalStatus.COMPLETED:
-            return
+            # A cached provider COMPLETED can predate the just-delivered prompt:
+            # codex may still be showing only the prompt echo / startup frame in
+            # the pane while StatusMonitor has not yet observed the new turn.
+            # Treat COMPLETED as a post-input completion signal only after the
+            # worker has shown pickup evidence for this turn.
+            if observed_working:
+                return
         if current == TerminalStatus.IDLE:
             # Post-input IDLE only counts once the agent has actually started
             # working — otherwise the idle-before-processing window right after

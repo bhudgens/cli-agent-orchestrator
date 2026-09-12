@@ -730,15 +730,37 @@ class TestIdleCompletionSignal:
         assert result.last_message == "the answer"
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
 
-    def test_completed_marker_still_resolves_immediately(self):
-        """A COMPLETED marker resolves on the first poll (no observed-working
-        gate needed) — the original completion signal is preserved."""
+    def test_completed_marker_after_working_resolves(self):
+        """A COMPLETED marker resolves once the current turn has shown pickup."""
+        seq = [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
-            final_status=TerminalStatus.COMPLETED,
+            status_sequence=seq,
         )
         with create, send, delete, get_output, exit_cli, wait, status:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
+
+    def test_completed_before_any_work_does_not_resolve_early(self):
+        """A stale COMPLETED from before prompt pickup is not a final answer."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 60.0),
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0.05))
+
+        assert exc_info.value.kind == "timeout"
+        m_out.assert_not_called()
 
     def test_idle_before_any_work_does_not_resolve_early(self):
         """A bare IDLE with NO prior working state is the pre-pickup window, not
@@ -772,7 +794,7 @@ class TestIdleCompletionSignal:
         status_monitor.get_status itself, which cannot see HOW it was called, so a
         regression back to a bare synchronous call would stay green."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
-            final_status=TerminalStatus.COMPLETED,
+            status_sequence=[TerminalStatus.PROCESSING, TerminalStatus.COMPLETED],
         )
         with (
             create,
@@ -813,7 +835,12 @@ class TestPromptDeliveryVerification:
             delivered = {"again": False}
 
             def _get_status(_terminal_id):
-                return TerminalStatus.COMPLETED if delivered["again"] else TerminalStatus.IDLE
+                if not delivered["again"]:
+                    return TerminalStatus.IDLE
+                if delivered.get("worked"):
+                    return TerminalStatus.COMPLETED
+                delivered["worked"] = True
+                return TerminalStatus.PROCESSING
 
             def _redeliver(_terminal_id, _message, _attempt, **_kwargs):
                 delivered["again"] = True
@@ -1077,7 +1104,7 @@ class TestInterruptibleCancel:
 class TestOutputExtractionTeardown:
     def test_extraction_failure_tears_down_created_terminal(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
-            final_status=TerminalStatus.COMPLETED,
+            status_sequence=[TerminalStatus.PROCESSING, TerminalStatus.COMPLETED],
         )
         with (
             create,
@@ -1100,7 +1127,7 @@ class TestOutputExtractionTeardown:
 
     def test_extraction_failure_does_not_tear_down_reused_terminal(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
-            final_status=TerminalStatus.COMPLETED,
+            status_sequence=[TerminalStatus.PROCESSING, TerminalStatus.COMPLETED],
         )
         with (
             create,

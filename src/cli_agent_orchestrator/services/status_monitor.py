@@ -779,6 +779,18 @@ class StatusMonitor:
             else:
                 buffer = ""
 
+        if cached == TerminalStatus.UNKNOWN:
+            # After a cao-server restart, tmux panes and DB terminal rows can
+            # both be alive while this process has no FIFO-fed status cache yet.
+            # Do one bounded live-pane probe so the web UI/inbox service can
+            # re-adopt existing sessions instead of leaving them Unknown until
+            # every project session is restarted.
+            fresh_capture = self._fresh_capture_pane_status(terminal_id, generation=0)
+            if fresh_capture is not None and fresh_capture != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh_capture)
+                return fresh_capture
+            return TerminalStatus.UNKNOWN
+
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh = self._detect_status(terminal_id, buffer)
             logger.debug(
