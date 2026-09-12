@@ -4,14 +4,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.services import terminal_service as terminal_service_mod
 from cli_agent_orchestrator.services.terminal_service import (
+    TerminalAdoptionConflict,
+    adopt_terminal,
     adopt_terminal_runtime,
     exit_terminal_cli,
     get_working_directory,
     list_siblings,
     send_special_key,
 )
-from cli_agent_orchestrator.services import terminal_service as terminal_service_mod
 
 
 def test_grok_uses_runtime_skills_with_native_tool_enforcement():
@@ -79,6 +81,139 @@ class TestAdoptTerminalRuntime:
         backend.stop_pipe_pane.assert_called_once_with("cao-live", "chief-of-staff")
         backend.pipe_pane.assert_called_once()
         mock_status_monitor.seed_from_history.assert_called_once_with("term1", "mock> ready")
+
+
+class TestAdoptTerminal:
+    """Explicit adoption writes only the registry and runtime plumbing."""
+
+    def test_adopt_terminal_binds_existing_window_without_killing_it(
+        self, isolated_memory_db, tmp_path, monkeypatch
+    ):
+        class Backend:
+            def __init__(self):
+                self.kill_session_calls = []
+                self.kill_window_calls = []
+
+            def session_exists(self, session_name):
+                return session_name == "cao-live"
+
+            def list_windows(self, session_name):
+                return [{"name": "anchor-dev-new", "index": "3"}]
+
+            def kill_session(self, session_name):
+                self.kill_session_calls.append(session_name)
+                return False
+
+            def kill_window(self, session_name, window_name):
+                self.kill_window_calls.append((session_name, window_name))
+                return False
+
+        backend = Backend()
+        runtime_calls = []
+        delivered = []
+        monkeypatch.setattr(terminal_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            terminal_service_mod,
+            "_persist_recovery_metadata",
+            lambda record: runtime_calls.append(("metadata", record)) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service_mod,
+            "adopt_terminal_runtime",
+            lambda terminal_id: runtime_calls.append(("runtime", terminal_id)) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service_mod,
+            "get_terminal",
+            lambda terminal_id: {"id": terminal_id},
+        )
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+
+        result = adopt_terminal(
+            terminal_id="c8397e50",
+            session_name="cao-live",
+            window_name="anchor-dev-new",
+            provider="codex",
+            agent_profile="developer",
+            working_directory=str(tmp_path),
+            caller_id="5a88b9bb",
+            metadata={"role": "anchor-dev"},
+        )
+
+        row = terminal_service_mod.get_terminal_metadata("c8397e50")
+        assert result == {"id": "c8397e50"}
+        assert row["tmux_session"] == "cao-live"
+        assert row["tmux_window"] == "anchor-dev-new"
+        assert row["provider"] == "codex"
+        assert row["working_directory"] == str(tmp_path)
+        assert runtime_calls[0][0] == "metadata"
+        assert runtime_calls[1] == ("runtime", "c8397e50")
+        assert delivered == ["c8397e50"]
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_adopt_terminal_rejects_duplicate_window_names_before_mutation(
+        self, isolated_memory_db, tmp_path, monkeypatch
+    ):
+        class Backend:
+            def __init__(self):
+                self.kill_session_calls = []
+                self.kill_window_calls = []
+
+            def session_exists(self, session_name):
+                return session_name == "cao-live"
+
+            def list_windows(self, session_name):
+                return [
+                    {"name": "anchor-dev-new", "index": "1"},
+                    {"name": "anchor-dev-new", "index": "2"},
+                ]
+
+            def kill_session(self, session_name):
+                self.kill_session_calls.append(session_name)
+                return False
+
+            def kill_window(self, session_name, window_name):
+                self.kill_window_calls.append((session_name, window_name))
+                return False
+
+        backend = Backend()
+        persisted = MagicMock()
+        runtime = MagicMock()
+        delivered = []
+        monkeypatch.setattr(terminal_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service_mod, "_persist_recovery_metadata", persisted)
+        monkeypatch.setattr(terminal_service_mod, "adopt_terminal_runtime", runtime)
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+
+        with pytest.raises(TerminalAdoptionConflict, match="ambiguous"):
+            adopt_terminal(
+                terminal_id="c8397e50",
+                session_name="cao-live",
+                window_name="anchor-dev-new",
+                provider="codex",
+                agent_profile="developer",
+                working_directory=str(tmp_path),
+            )
+
+        assert terminal_service_mod.get_terminal_metadata("c8397e50") is None
+        persisted.assert_not_called()
+        runtime.assert_not_called()
+        assert delivered == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
 
 
 class TestTerminalServiceWorkingDirectory:

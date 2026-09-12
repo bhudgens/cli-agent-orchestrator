@@ -102,6 +102,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -160,6 +161,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     IdempotencyKeyConflict,
     OutputMode,
+    TerminalAdoptionConflict,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
 )
@@ -961,6 +963,49 @@ class WorkingDirectoryResponse(BaseModel):
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class AdoptTerminalRequest(BaseModel):
+    """Explicit identity for adopting an already-live terminal window.
+
+    This request is intentionally more explicit than normal terminal creation:
+    a restart-recovery caller must prove which live window and terminal id it
+    means.  The endpoint never creates a tmux resource or infers identity from
+    a name such as ``anchor-dev-new``.
+    """
+
+    terminal_id: TerminalId = Field(description="The CAO terminal id to restore")
+    session_name: str = Field(description="Existing CAO tmux session name")
+    window_name: str = Field(description="Existing tmux window name")
+    provider: ProviderType = Field(description="Provider already running in the window")
+    agent_profile: str = Field(description="Agent profile used by the running provider")
+    working_directory: str = Field(description="Working directory of the live pane")
+    caller_id: Optional[str] = Field(
+        default=None, description="Optional supervisor terminal id for callback routing"
+    )
+    allowed_tools: Optional[List[str]] = Field(
+        default=None, description="Persisted allowed-tools policy for the terminal"
+    )
+    engine: Optional[KiroEngine] = Field(
+        default=None, description="Resolved Kiro engine, when provider is kiro_cli"
+    )
+    shell_command: Optional[str] = Field(
+        default=None, description="Shell command captured before provider launch"
+    )
+    group: Optional[List[str]] = Field(default=None, description="Discovery grouping levels")
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None, description="Consumer-defined terminal metadata"
+    )
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        return _check_metadata_size(v)
 
 
 class InstallAgentProfileRequest(BaseModel):
@@ -3366,6 +3411,46 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
+        )
+
+
+@app.post("/terminals/adopt", response_model=Terminal)
+async def adopt_terminal_endpoint(
+    body: AdoptTerminalRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Terminal:
+    """Adopt one explicitly identified live tmux window after a restart.
+
+    This is an operator/admin recovery surface for legacy persistent workers
+    whose SQLite row predates restart metadata.  All tmux validation and
+    runtime re-registration stays in ``terminal_service.adopt_terminal`` so
+    the CLI and API share one non-destructive implementation.
+    """
+    try:
+        terminal = await asyncio.to_thread(
+            terminal_service.adopt_terminal,
+            terminal_id=body.terminal_id,
+            session_name=body.session_name,
+            window_name=body.window_name,
+            provider=body.provider,
+            agent_profile=body.agent_profile,
+            working_directory=body.working_directory,
+            caller_id=body.caller_id,
+            allowed_tools=body.allowed_tools,
+            engine=body.engine,
+            shell_command=body.shell_command,
+            group=body.group,
+            metadata=body.metadata,
+        )
+        return Terminal(**terminal)
+    except TerminalAdoptionConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except (KiroPhase0KASError, KiroCapabilityError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to adopt terminal: {str(e)}",
         )
 
 

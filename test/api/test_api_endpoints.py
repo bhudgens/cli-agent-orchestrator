@@ -22,6 +22,7 @@ from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
+    TerminalAdoptionConflict,
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -1295,6 +1296,71 @@ class TestGetTerminal:
         """GET /terminals/{id} returns 422 for invalid ID format."""
         response = client.get("/terminals/not-valid-hex")
         assert response.status_code == 422
+
+
+class TestAdoptTerminal:
+    """Tests for the explicit admin restart-recovery endpoint."""
+
+    def test_adopt_terminal_forwards_explicit_identity(self, client, tmp_path):
+        adopted = {
+            "id": "c8397e50",
+            "name": "anchor-dev-new",
+            "session_name": "cao-live",
+            "provider": "codex",
+            "agent_profile": "developer",
+            "caller_id": "5a88b9bb",
+            "allowed_tools": None,
+            "engine": None,
+            "metadata": {"role": "anchor-dev"},
+        }
+        body = {
+            "terminal_id": "c8397e50",
+            "session_name": "cao-live",
+            "window_name": "anchor-dev-new",
+            "provider": "codex",
+            "agent_profile": "developer",
+            "working_directory": str(tmp_path),
+            "caller_id": "5a88b9bb",
+            "metadata": {"role": "anchor-dev"},
+        }
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.adopt_terminal.return_value = adopted
+            response = client.post("/terminals/adopt", json=body)
+
+        assert response.status_code == 200
+        assert response.json()["id"] == "c8397e50"
+        mock_svc.adopt_terminal.assert_called_once_with(
+            terminal_id="c8397e50",
+            session_name="cao-live",
+            window_name="anchor-dev-new",
+            provider="codex",
+            agent_profile="developer",
+            working_directory=str(tmp_path),
+            caller_id="5a88b9bb",
+            allowed_tools=None,
+            engine=None,
+            shell_command=None,
+            group=None,
+            metadata={"role": "anchor-dev"},
+        )
+
+    def test_adopt_terminal_reports_identity_conflict(self, client, tmp_path):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.adopt_terminal.side_effect = TerminalAdoptionConflict("window is owned")
+            response = client.post(
+                "/terminals/adopt",
+                json={
+                    "terminal_id": "c8397e50",
+                    "session_name": "cao-live",
+                    "window_name": "anchor-dev-new",
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "working_directory": str(tmp_path),
+                },
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "window is owned"
 
 
 class TestSendTerminalInput:

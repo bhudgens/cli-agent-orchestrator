@@ -46,6 +46,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     list_all_terminals,
     list_siblings_by_group_prefix,
+    list_terminals_by_session,
     update_last_active,
     update_terminal_group,
     update_terminal_metadata,
@@ -104,6 +105,12 @@ from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
+from cli_agent_orchestrator.services.terminal_recovery import (
+    build_recovery_metadata,
+    delete_recovery_manifest,
+    tmux_recovery_metadata,
+    write_recovery_manifest,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
@@ -153,6 +160,16 @@ class TerminalRecordCorruptError(Exception):
     """
 
 
+class TerminalAdoptionConflict(Exception):
+    """A live tmux window cannot be safely bound to the requested terminal id.
+
+    Adoption is a state-changing operator operation, but it must not silently
+    steal a window already owned by another row or overwrite a terminal id
+    whose durable coordinates disagree.  Keeping this separate from
+    ``ValueError`` lets the HTTP layer expose a useful 409 response.
+    """
+
+
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
 # caller (playback fetching output around a selected event) can never trigger
@@ -185,6 +202,82 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+
+def _persist_recovery_metadata(metadata: Dict[str, Any]) -> bool:
+    """Best-effort persist the durable identity for one live terminal.
+
+    The SQLite row remains the primary live registry.  Recovery metadata is a
+    second, deliberately redundant copy: a write failure must not make a
+    healthy launch fail, but it must be visible in logs and leave the normal
+    operator adoption endpoint available as a fallback.
+    """
+    try:
+        record = write_recovery_manifest(metadata)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist recovery metadata for terminal %s: %s",
+            metadata.get("terminal_id", metadata.get("id")),
+            exc,
+        )
+        return False
+
+    try:
+        backend = get_backend()
+    except Exception as exc:
+        # The file remains a complete recovery source even when backend lookup
+        # is temporarily unavailable during startup or a provider transition.
+        logger.warning(
+            "Could not resolve backend while mirroring recovery metadata for terminal %s: %s",
+            record["terminal_id"],
+            exc,
+        )
+        return True
+    setter = getattr(backend, "set_window_metadata", None)
+    if callable(setter):
+        try:
+            setter(
+                record["tmux_session"],
+                record["tmux_window"],
+                tmux_recovery_metadata(record),
+            )
+        except Exception as exc:
+            # The file is still a valid recovery source.  A backend without
+            # native metadata, or a transient tmux option write failure, must
+            # not turn an otherwise live terminal into a failed launch.
+            logger.warning(
+                "Could not mirror recovery metadata into tmux for terminal %s: %s",
+                record["terminal_id"],
+                exc,
+            )
+    return True
+
+
+def ensure_terminal_recovery_metadata(
+    terminal_id: str, metadata: Optional[Dict[str, Any]] = None
+) -> bool:
+    """Backfill durable recovery metadata for an existing terminal row.
+
+    This is called during restart resync, so terminals created before this
+    feature gain the metadata needed by *future* restarts without changing
+    their tmux process or window.
+    """
+    try:
+        row = metadata or get_terminal_metadata(terminal_id)
+        if not row:
+            return False
+        return _persist_recovery_metadata(row)
+    except Exception as exc:
+        logger.warning("Could not backfill recovery metadata for terminal %s: %s", terminal_id, exc)
+        return False
+
+
+def _remove_recovery_metadata(terminal_id: str) -> None:
+    """Best-effort removal of a manifest after a terminal is truly deleted."""
+    try:
+        delete_recovery_manifest(terminal_id)
+    except Exception:
+        logger.warning("Could not remove recovery metadata for terminal %s", terminal_id)
 
 
 def inject_memory_context(
@@ -400,7 +493,9 @@ def _roll_back_cancelled_create(
     with session_lifecycle_lock(session_name):
         _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
         try:
-            db_delete_terminal(terminal_id)
+            deleted = db_delete_terminal(terminal_id)
+            if deleted:
+                _remove_recovery_metadata(terminal_id)
         except Exception:
             logger.exception(
                 f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
@@ -1294,7 +1389,15 @@ async def create_terminal(
                         # Drop rows a previous incarnation of this session name
                         # left behind. Inside the lock, so it can never race the
                         # row write of a concurrent create for the same name.
+                        try:
+                            stale_terminal_ids = [
+                                row["id"] for row in list_terminals_by_session(session_name)
+                            ]
+                        except Exception:
+                            stale_terminal_ids = []
                         delete_terminals_by_session(session_name)
+                        for stale_terminal_id in stale_terminal_ids:
+                            _remove_recovery_metadata(stale_terminal_id)
 
                         if env_vars:
                             # Persist forwarded env only after the tmux session
@@ -1324,6 +1427,33 @@ async def create_terminal(
                         working_directory=resolved_working_directory,
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
+                    )
+
+                    # Keep a second, durable identity copy beside the DB row
+                    # and on the tmux window.  If a process dies after tmux
+                    # creation but a later recovery cannot see the row, exact
+                    # coordinates and launch policy are still available for a
+                    # conservative re-adoption.  This is best-effort so a
+                    # filesystem or backend metadata hiccup does not strand a
+                    # healthy provider launch; the row itself remains the
+                    # source of truth while it exists.
+                    _persist_recovery_metadata(
+                        {
+                            "terminal_id": terminal_id,
+                            "tmux_session": session_name,
+                            "tmux_window": created_window_name,
+                            "provider": provider,
+                            "agent_profile": agent_profile,
+                            "working_directory": resolved_working_directory,
+                            "allowed_tools": allowed_tools,
+                            "caller_id": caller_id,
+                            "engine": (
+                                resolved_engine.value if resolved_engine is not None else None
+                            ),
+                            "group": group,
+                            "metadata": metadata,
+                            "model": model or (profile.model if profile else None),
+                        }
                     )
                 except BaseException:
                     _roll_back_backend_create_locked(
@@ -1447,6 +1577,7 @@ async def create_terminal(
                     shell_command = None
                 if shell_command:
                     update_terminal_shell_command(terminal_id, shell_command)
+                    ensure_terminal_recovery_metadata(terminal_id)
                 if initial_message:
                     effective_orchestration_type = (
                         initial_message_orchestration_type or OrchestrationType.ASSIGN
@@ -1490,6 +1621,7 @@ async def create_terminal(
                 shell_command = None
             if shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
+                ensure_terminal_recovery_metadata(terminal_id)
 
         # Build and return the Terminal object. In the deferred-init path the
         # provider is still initializing on a background task, so the terminal
@@ -1610,7 +1742,9 @@ async def create_terminal(
         if cleanup_complete:
             try:
                 if terminal_id is not None:
-                    db_delete_terminal(terminal_id)
+                    deleted = db_delete_terminal(terminal_id)
+                    if deleted:
+                        _remove_recovery_metadata(terminal_id)
             except Exception:
                 pass  # Ignore cleanup errors
         elif terminal_id is not None:
@@ -2041,6 +2175,7 @@ def _schedule_deferred_init(
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
+                ensure_terminal_recovery_metadata(terminal_id)
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server; _assign_impl on the MCP-server side already
@@ -2204,6 +2339,12 @@ def adopt_terminal_runtime(terminal_id: str) -> bool:
     if not metadata:
         return False
 
+    # Backfill the durable identity for rows created before restart adoption
+    # shipped.  This does not touch the pane and is intentionally best-effort;
+    # the runtime path below can still restore a row whose filesystem mirror is
+    # temporarily unavailable.
+    ensure_terminal_recovery_metadata(terminal_id, metadata)
+
     with _runtime_adoption_lock:
         if terminal_id in _runtime_adopted_terminals:
             return False
@@ -2236,6 +2377,161 @@ def adopt_terminal_runtime(terminal_id: str) -> bool:
     return True
 
 
+def adopt_terminal(
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    provider: str | ProviderType,
+    agent_profile: str,
+    working_directory: Optional[str] = None,
+    caller_id: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
+    engine: Optional[KiroEngine | str] = None,
+    shell_command: Optional[str] = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Adopt one explicitly identified live tmux window into CAO.
+
+    This is the supported operator recovery path for terminals created before
+    durable recovery metadata existed (for example, a legacy
+    ``anchor-dev-new`` window whose row disappeared during a server restart).
+    It validates the exact session/window, refuses row or window collisions,
+    writes the registry through the normal database client, and then invokes
+    the same provider/FIFO/status restoration used by restart resync.
+
+    The function never creates, renames, or kills a tmux session/window, and it
+    sends no new recovery probe or operator input to the pane.  The normal
+    pending-inbox retry may still deliver messages that were already queued for
+    this terminal after runtime registration succeeds. ``working_directory``
+    may be omitted only when the live pane can report one; the caller therefore
+    cannot accidentally adopt a window with an invented cwd.
+    """
+    provider_value = provider.value if isinstance(provider, ProviderType) else provider
+    if not isinstance(provider_value, str):
+        raise ValueError("provider must be a string")
+
+    engine_value = engine.value if isinstance(engine, KiroEngine) else engine
+    if provider_value == ProviderType.KIRO_CLI.value:
+        resolved_engine = resolve_kiro_engine(persisted=engine_value)
+        if resolved_engine == KiroEngine.KAS:
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        engine_value = resolved_engine.value
+    elif engine_value is not None:
+        raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+
+    # ``build_recovery_metadata`` is the single strict identity validator for
+    # both file-backed and operator-supplied adoption.  It rejects malformed
+    # ids/names and, importantly, requires an explicit profile/provider/cwd.
+    record: Dict[str, Any] = {
+        "terminal_id": terminal_id,
+        "tmux_session": session_name,
+        "tmux_window": window_name,
+        "provider": provider_value,
+        "agent_profile": agent_profile,
+        "working_directory": working_directory,
+        "allowed_tools": allowed_tools,
+        "shell_command": shell_command,
+        "caller_id": caller_id,
+        "engine": engine_value,
+        "group": group,
+        "metadata": metadata,
+    }
+
+    backend = get_backend()
+    with session_lifecycle_lock(session_name):
+        if not backend.session_exists(session_name):
+            raise ValueError(f"Session '{session_name}' not found")
+
+        windows = backend.list_windows(session_name)
+        matching_windows = [window for window in windows if str(window.get("name")) == window_name]
+        if not matching_windows:
+            raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+        if len(matching_windows) > 1:
+            raise TerminalAdoptionConflict(
+                f"window name '{window_name}' is ambiguous: "
+                f"{len(matching_windows)} live windows match"
+            )
+
+        if working_directory is None:
+            working_directory = backend.get_pane_working_directory(session_name, window_name)
+            record["working_directory"] = working_directory
+        else:
+            # Resolve and validate explicit paths at the operator boundary,
+            # matching normal terminal creation. Auto-resync passes the path
+            # from an already validated manifest and still benefits from the
+            # same canonical value.
+            record["working_directory"] = _resolve_working_directory(working_directory)
+
+        # Validate again after resolving a live cwd. The first validation above
+        # intentionally happens only after all fields are present because a
+        # missing operator cwd is allowed to be filled from the pane.
+        record = build_recovery_metadata(record)
+
+        existing = get_terminal_metadata(terminal_id)
+        if existing:
+            # An explicit re-adoption of the same id is idempotent only when it
+            # names the same identity. Never silently move a row to a different
+            # live window or alter its provider/profile policy.
+            for field in (
+                "tmux_session",
+                "tmux_window",
+                "provider",
+                "agent_profile",
+                "caller_id",
+                "engine",
+            ):
+                if existing.get(field) != record.get(field):
+                    raise TerminalAdoptionConflict(
+                        f"terminal '{terminal_id}' already exists with different {field}"
+                    )
+            existing_cwd = existing.get("working_directory")
+            if existing_cwd and os.path.realpath(existing_cwd) != os.path.realpath(
+                record["working_directory"]
+            ):
+                raise TerminalAdoptionConflict(
+                    f"terminal '{terminal_id}' already exists with different working_directory"
+                )
+        else:
+            for row in list_terminals_by_session(session_name):
+                if row.get("tmux_window") == window_name and row.get("id") != terminal_id:
+                    raise TerminalAdoptionConflict(
+                        f"window '{window_name}' is already mapped to terminal '{row['id']}'"
+                    )
+
+            db_create_terminal(
+                terminal_id=record["terminal_id"],
+                tmux_session=record["tmux_session"],
+                tmux_window=record["tmux_window"],
+                provider=record["provider"],
+                agent_profile=record["agent_profile"],
+                allowed_tools=record.get("allowed_tools"),
+                shell_command=record.get("shell_command"),
+                caller_id=record.get("caller_id"),
+                engine=record.get("engine"),
+                group=record.get("group"),
+                metadata=record.get("metadata"),
+                working_directory=record["working_directory"],
+            )
+
+        # Persist to both recovery stores before runtime registration. If the
+        # file/backend mirror is unavailable, the row and explicit adoption
+        # still remain usable; the warning is emitted by the helper and the
+        # operator can retry the same request later.
+        _persist_recovery_metadata(record)
+
+        # This call restores provider lookup, FIFO/pipe-pane streaming, and the
+        # status/output seed. It is one-shot per process, but an already adopted
+        # terminal is still a valid idempotent success for this operation.
+        adopt_terminal_runtime(terminal_id)
+
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        inbox_service.deliver_pending(terminal_id)
+
+    return get_terminal(terminal_id)
+
+
 def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
     """Replace a terminal's group array.
 
@@ -2247,7 +2543,10 @@ def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
     Returns:
         False if the terminal does not exist, True otherwise.
     """
-    return update_terminal_group(terminal_id, group)
+    updated = update_terminal_group(terminal_id, group)
+    if updated:
+        ensure_terminal_recovery_metadata(terminal_id)
+    return updated
 
 
 def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
@@ -2261,7 +2560,10 @@ def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> boo
     Returns:
         False if the terminal does not exist, True otherwise.
     """
-    return update_terminal_metadata(terminal_id, metadata)
+    updated = update_terminal_metadata(terminal_id, metadata)
+    if updated:
+        ensure_terminal_recovery_metadata(terminal_id)
+    return updated
 
 
 def list_siblings(
@@ -3026,6 +3328,8 @@ def delete_terminal_row(
     """
     deleted = db_delete_terminal(terminal_id)
     logger.info(f"Deleted terminal: {terminal_id}")
+    if deleted:
+        _remove_recovery_metadata(terminal_id)
     if deleted and metadata:
         dispatch_plugin_event(
             registry,

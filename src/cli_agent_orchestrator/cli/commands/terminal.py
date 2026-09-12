@@ -8,6 +8,8 @@ import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import API_BASE_URL, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
 
 
@@ -82,3 +84,106 @@ def restore(terminal_id: str):
     )
     if working_directory:
         click.echo(f"Working directory: {working_directory}")
+
+
+@terminal.command("adopt")
+@click.option("--terminal-id", required=True, help="Existing CAO terminal id to restore")
+@click.option("--session-name", required=True, help="Existing CAO tmux session name")
+@click.option("--window-name", required=True, help="Existing tmux window name")
+@click.option(
+    "--provider",
+    type=click.Choice([provider.value for provider in ProviderType]),
+    required=True,
+    help="Provider already running in the live window",
+)
+@click.option("--agent-profile", required=True, help="Profile used by the running provider")
+@click.option("--working-directory", required=True, help="Working directory of the live pane")
+@click.option("--caller-id", default=None, help="Supervisor terminal id for callback routing")
+@click.option(
+    "--allowed-tool",
+    "allowed_tools",
+    multiple=True,
+    help="Allowed tool (repeat for multiple tools)",
+)
+@click.option(
+    "--engine",
+    type=click.Choice([engine.value for engine in KiroEngine]),
+    default=None,
+    help="Resolved Kiro engine (only for provider kiro_cli)",
+)
+@click.option("--shell-command", default=None, help="Captured shell command, if known")
+@click.option("--group", "group_levels", multiple=True, help="Discovery group level (repeatable)")
+@click.option(
+    "--metadata-json",
+    default=None,
+    help="JSON object containing consumer-defined terminal metadata",
+)
+def adopt(
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    provider: str,
+    agent_profile: str,
+    working_directory: str,
+    caller_id: str | None,
+    allowed_tools: tuple[str, ...],
+    engine: str | None,
+    shell_command: str | None,
+    group_levels: tuple[str, ...],
+    metadata_json: str | None,
+) -> None:
+    """Re-adopt a named live tmux window into CAO after a server restart.
+
+    The server validates that the exact session/window exists and restores
+    runtime plumbing.  It never creates, renames, or kills the tmux resource.
+    """
+    metadata = None
+    if metadata_json is not None:
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"--metadata-json must be valid JSON: {exc.msg}") from exc
+        if not isinstance(metadata, dict):
+            raise click.ClickException("--metadata-json must contain a JSON object")
+
+    body = {
+        "terminal_id": terminal_id,
+        "session_name": session_name,
+        "window_name": window_name,
+        "provider": provider,
+        "agent_profile": agent_profile,
+        "working_directory": working_directory,
+        "caller_id": caller_id,
+        "allowed_tools": list(allowed_tools) or None,
+        "engine": engine,
+        "shell_command": shell_command,
+        "group": list(group_levels) or None,
+        "metadata": metadata,
+    }
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/adopt",
+            json=body,
+            timeout=30,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise click.ClickException("Failed to connect to cao-server") from exc
+    except requests.exceptions.RequestException as exc:
+        raise click.ClickException(f"Failed to adopt terminal: {exc}") from exc
+
+    if response.status_code >= 400:
+        try:
+            payload = response.json()
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        except (ValueError, requests.exceptions.RequestException):
+            detail = response.text or f"HTTP {response.status_code}"
+        raise click.ClickException(f"Adoption failed: {detail}")
+
+    try:
+        adopted_terminal = response.json()
+    except ValueError as exc:
+        raise click.ClickException("cao-server returned invalid adoption JSON") from exc
+    adopted_id = adopted_terminal.get("id", terminal_id)
+    click.echo(
+        f"Adopted terminal {adopted_id} as window '{window_name}' in session '{session_name}'"
+    )

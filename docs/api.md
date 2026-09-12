@@ -154,6 +154,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- `POST /terminals/adopt` is the admin-only explicit recovery path for a live
+  tmux window whose terminal row is missing after a server restart. It requires
+  the terminal id, exact session/window, provider, agent profile, working
+  directory, and optional caller/policy metadata; it never creates or kills the
+  named tmux resource and restores CAO runtime plumbing after the row is added.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
