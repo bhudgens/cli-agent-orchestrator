@@ -54,6 +54,14 @@ class TmuxBackend(TerminalBackend):
     def list_windows(self, session_name: str) -> List[Dict[str, str]]:
         return self._client.get_session_windows(session_name)
 
+    def set_window_metadata(
+        self, session_name: str, window_name: str, metadata: Dict[str, str]
+    ) -> None:
+        self._client.set_window_metadata(session_name, window_name, metadata)
+
+    def get_window_metadata(self, session_name: str, window_name: str) -> Dict[str, str]:
+        return self._client.get_window_metadata(session_name, window_name)
+
     def kill_session(self, session_name: str) -> bool:
         return self._client.kill_session(session_name)
 

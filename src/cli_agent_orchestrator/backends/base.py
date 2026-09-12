@@ -117,6 +117,23 @@ class TerminalBackend(ABC):
         """
         return []
 
+    def set_window_metadata(
+        self, session_name: str, window_name: str, metadata: Dict[str, str]
+    ) -> None:
+        """Persist backend-native metadata for a live window when supported.
+
+        Restart recovery must never require a backend to invent a terminal
+        identity from a window name.  Tmux implements this with per-window
+        user options; backends without a durable window metadata primitive may
+        leave the default no-op and rely on CAO's recovery manifest/operator
+        adoption path instead.
+        """
+        return None
+
+    def get_window_metadata(self, session_name: str, window_name: str) -> Dict[str, str]:
+        """Read backend-native metadata for a live window if available."""
+        return {}
+
     @abstractmethod
     def kill_session(self, session_name: str) -> bool:
         """Kill/destroy a session.

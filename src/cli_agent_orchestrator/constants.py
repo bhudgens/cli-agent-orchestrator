@@ -126,6 +126,14 @@ LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+# Versioned per-terminal identity manifests used to recover a live tmux window
+# whose SQLite row disappeared during a cao-server restart.  This is separate
+# from ``TERMINAL_LOG_DIR`` because log/snapshot files describe output and
+# teardown; recovery manifests describe a terminal that is expected to remain
+# live.  The directory is CAO-owned and never placed in a user's repository.
+TERMINAL_RECOVERY_DIR = CAO_HOME_DIR / "terminal-recovery"
+TERMINAL_RECOVERY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
