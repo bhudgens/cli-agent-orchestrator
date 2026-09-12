@@ -78,13 +78,41 @@ class TestTerminalServiceWorkingDirectory:
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_working_directory_returns_none(self, mock_get_metadata, mock_tmux_client):
-        """Test when pane has no working directory."""
+    def test_get_working_directory_falls_back_to_persisted_working_directory(
+        self, mock_get_metadata, mock_tmux_client
+    ):
+        """Test fallback to persisted working directory when pane cwd is unavailable."""
         # Arrange
         terminal_id = "test-terminal-456"
         mock_get_metadata.return_value = {
             "tmux_session": "test-session",
             "tmux_window": "test-window",
+            "working_directory": "/persisted/launch-dir",
+        }
+        mock_tmux_client.get_pane_working_directory.return_value = None
+
+        # Act
+        result = get_working_directory(terminal_id)
+
+        # Assert
+        assert result == "/persisted/launch-dir"
+        mock_get_metadata.assert_called_once_with(terminal_id)
+        mock_tmux_client.get_pane_working_directory.assert_called_once_with(
+            "test-session", "test-window"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_working_directory_returns_none_without_live_or_persisted_cwd(
+        self, mock_get_metadata, mock_tmux_client
+    ):
+        """Test when neither the pane nor metadata has a working directory."""
+        # Arrange
+        terminal_id = "test-terminal-no-cwd"
+        mock_get_metadata.return_value = {
+            "tmux_session": "test-session",
+            "tmux_window": "test-window",
+            "working_directory": None,
         }
         mock_tmux_client.get_pane_working_directory.return_value = None
 
