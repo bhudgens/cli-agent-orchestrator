@@ -2262,13 +2262,17 @@ def list_siblings(
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
-    """Get the current working directory of a terminal's pane.
+    """Get the current working directory of a terminal.
+
+    Prefer the live pane cwd because the user may have changed directories
+    after launch. If the backend cannot resolve the pane (for example because
+    a tmux window was renamed), fall back to the persisted launch cwd.
 
     Args:
         terminal_id: The terminal identifier
 
     Returns:
-        Working directory path, or None if pane has no directory
+        Working directory path, or None if neither live nor persisted cwd exists
 
     Raises:
         ValueError: If terminal not found
@@ -2282,7 +2286,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
-        return working_dir
+        return working_dir or metadata.get("working_directory")
 
     except Exception as e:
         logger.error(f"Failed to get working directory for terminal {terminal_id}: {e}")
