@@ -240,6 +240,7 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            metadata.get("allowed_tools"),
             engine=persisted_engine,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.

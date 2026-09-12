@@ -1264,6 +1264,10 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    from cli_agent_orchestrator.services.session_service import resync_live_terminals
+
+    asyncio.create_task(asyncio.to_thread(resync_live_terminals))
+
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
     from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled

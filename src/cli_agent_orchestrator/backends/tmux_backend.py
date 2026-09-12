@@ -51,6 +51,9 @@ class TmuxBackend(TerminalBackend):
     def list_sessions(self) -> List[Dict[str, str]]:
         return self._client.list_sessions()
 
+    def list_windows(self, session_name: str) -> List[Dict[str, str]]:
+        return self._client.get_session_windows(session_name)
+
     def kill_session(self, session_name: str) -> bool:
         return self._client.kill_session(session_name)
 
