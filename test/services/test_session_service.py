@@ -932,6 +932,190 @@ class TestGetSession:
             get_session("cao-test")
 
 
+class TestRestartResync:
+    """Regression coverage for restart-safe live terminal adoption."""
+
+    class _Backend:
+        def __init__(self, windows_by_session):
+            self.windows_by_session = windows_by_session
+            self.pipe_calls = []
+            self.stop_pipe_calls = []
+
+        def list_sessions(self):
+            return [
+                {"id": session_name, "name": session_name}
+                for session_name in self.windows_by_session
+            ]
+
+        def list_windows(self, session_name):
+            return self.windows_by_session[session_name]
+
+        def session_exists(self, session_name):
+            return session_name in self.windows_by_session
+
+        def supports_event_inbox(self):
+            return False
+
+        def get_history(self, session_name, window_name, tail_lines=None):
+            return "mock> ready"
+
+        def stop_pipe_pane(self, session_name, window_name):
+            self.stop_pipe_calls.append((session_name, window_name))
+
+        def pipe_pane(self, session_name, window_name, file_path):
+            self.pipe_calls.append((session_name, window_name, file_path))
+
+    def _terminal_row(self, terminal_id: str, window_name: str, session_name: str = "cao-live"):
+        db_mod.create_terminal(
+            terminal_id=terminal_id,
+            tmux_session=session_name,
+            tmux_window=window_name,
+            provider="mock_cli",
+            agent_profile="developer",
+            working_directory="/workspace",
+        )
+
+    def _patch_runtime(self, monkeypatch):
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        adopted = []
+        delivered = []
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal_runtime",
+            lambda terminal_id: adopted.append(terminal_id) or True,
+        )
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+        return adopted, delivered
+
+    def _clear_runtime_adoption(self, terminal_id: str):
+        with terminal_service._runtime_adoption_lock:
+            terminal_service._runtime_adopted_terminals.discard(terminal_id)
+
+    def test_resync_adopts_existing_live_terminal_and_retries_inbox(
+        self, real_session_db, monkeypatch
+    ):
+        self._terminal_row("term1", "developer-aaaa")
+        backend = self._Backend({"cao-live": [{"name": "developer-aaaa", "index": "0"}]})
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        adopted, delivered = self._patch_runtime(monkeypatch)
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["adopted"] == ["term1"]
+        assert report["repaired"] == []
+        assert report["pruned"] == []
+        assert adopted == ["term1"]
+        assert delivered == ["term1"]
+
+    def test_resync_repairs_renamed_conductor_window_zero(self, real_session_db, monkeypatch):
+        self._terminal_row("term1", "code_supervisor-5d39")
+        backend = self._Backend({"cao-live": [{"name": "chief-of-staff", "index": "0"}]})
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        self._patch_runtime(monkeypatch)
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["repaired"] == ["term1"]
+        assert report["adopted"] == ["term1"]
+        assert get_terminal_metadata("term1")["tmux_window"] == "chief-of-staff"
+
+    def test_resync_prunes_dead_window_row_without_killing_session(self, real_session_db, monkeypatch):
+        self._terminal_row("live1", "developer-live")
+        self._terminal_row("dead1", "reviewer-gone")
+        backend = self._Backend({"cao-live": [{"name": "developer-live", "index": "0"}]})
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        adopted, delivered = self._patch_runtime(monkeypatch)
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["adopted"] == ["live1"]
+        assert report["pruned"] == ["dead1"]
+        assert get_terminal_metadata("dead1") is None
+        assert adopted == ["live1"]
+        assert delivered == ["live1"]
+
+    def test_repeated_get_session_does_not_reattach_adopted_terminal_runtime(
+        self, real_session_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        terminal_id = "term-idempotent-adopt"
+        self._clear_runtime_adoption(terminal_id)
+        self._terminal_row(terminal_id, "developer-live")
+        backend = self._Backend({"cao-live": [{"name": "developer-live", "index": "0"}]})
+        provider_calls = []
+        reader_calls = []
+        seed_calls = []
+        delivered = []
+
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            terminal_service.provider_manager,
+            "get_provider",
+            lambda terminal_id: provider_calls.append(terminal_id) or MagicMock(),
+        )
+        monkeypatch.setattr(
+            terminal_service.fifo_manager,
+            "create_reader",
+            lambda terminal_id, **_kwargs: reader_calls.append(terminal_id),
+        )
+        monkeypatch.setattr(
+            terminal_service.status_monitor,
+            "seed_from_history",
+            lambda terminal_id, history: seed_calls.append((terminal_id, history)),
+        )
+        monkeypatch.setattr(
+            terminal_service.status_monitor,
+            "get_status",
+            lambda terminal_id: TerminalStatus.IDLE,
+        )
+
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+
+        first = get_session("cao-live")
+        second = get_session("cao-live")
+
+        assert first["terminals"][0]["id"] == terminal_id
+        assert second["terminals"][0]["id"] == terminal_id
+        assert provider_calls == [terminal_id]
+        assert reader_calls == [terminal_id]
+        assert seed_calls == [(terminal_id, "mock> ready")]
+        assert backend.stop_pipe_calls == [("cao-live", "developer-live")]
+        assert len(backend.pipe_calls) == 1
+        assert backend.pipe_calls[0][0:2] == ("cao-live", "developer-live")
+        assert delivered == [terminal_id]
+
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    def test_get_session_reports_repaired_terminal_after_resync(
+        self, mock_get_status, real_session_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        self._terminal_row("term1", "code_supervisor-5d39")
+        backend = self._Backend({"cao-live": [{"name": "cao-assign-fix-supervisor", "index": "0"}]})
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        self._patch_runtime(monkeypatch)
+        mock_get_status.return_value = TerminalStatus.IDLE
+
+        result = get_session("cao-live")
+
+        assert result["session"]["id"] == "cao-live"
+        assert result["terminals"][0]["tmux_window"] == "cao-assign-fix-supervisor"
+        assert result["terminals"][0]["status"] == "idle"
+
+
 class TestDeleteSession:
     """Tests for delete_session function.
 

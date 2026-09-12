@@ -107,6 +107,16 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def list_windows(self, session_name: str) -> List[Dict[str, str]]:
+        """List windows in a session when the backend can enumerate them.
+
+        Restart adoption is a best-effort tmux reconciliation path. Backends
+        without a window listing primitive can safely return an empty list:
+        callers treat that as "cannot adopt" rather than as permission to
+        delete or mutate anything.
+        """
+        return []
+
     @abstractmethod
     def kill_session(self, session_name: str) -> bool:
         """Kill/destroy a session.

@@ -723,6 +723,17 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
+    def seed_from_history(self, terminal_id: str, output: str) -> None:
+        """Seed a freshly-started monitor from an already-live pane snapshot.
+
+        A cao-server restart loses the in-memory FIFO-derived rolling buffer,
+        but tmux still has the rendered pane. Feeding a bounded capture through
+        the same chunk path recreates the provider status latch and gives
+        ``GET /terminals/{id}/output`` useful content immediately after adoption.
+        """
+        if output:
+            self._process_chunk(terminal_id, output)
+
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
 

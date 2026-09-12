@@ -1793,6 +1793,17 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         return False
 
 
+def update_terminal_window(terminal_id: str, tmux_window: str) -> bool:
+    """Update a terminal row's tmux window after conservative live resync."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.tmux_window = tmux_window
+            db.commit()
+            return True
+        return False
+
+
 def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
     """List terminals for several tmux sessions in one query.
 

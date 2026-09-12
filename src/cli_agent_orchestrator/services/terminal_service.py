@@ -172,6 +172,12 @@ CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
+# Track live terminals whose runtime plumbing has already been restored in this
+# server process. Startup/control-plane resync can run repeatedly, but tmux
+# pipe-pane reattachment is disruptive, so adoption itself must be one-shot.
+_runtime_adopted_terminals: set[str] = set()
+_runtime_adoption_lock = threading.Lock()
+
 _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
@@ -2185,6 +2191,51 @@ def get_terminal(terminal_id: str) -> Dict:
         raise
 
 
+def adopt_terminal_runtime(terminal_id: str) -> bool:
+    """Re-register runtime services for an already-live terminal after restart.
+
+    This is intentionally non-destructive: it does not create, kill, rename, or
+    send input to the pane. It rebuilds the in-process provider adapter from the
+    durable DB row, reattaches pipe-pane/FIFO output plumbing for tmux backends,
+    and seeds the status monitor from tmux scrollback so status/output reads and
+    inbox delivery can recover without restarting the user's session.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return False
+
+    with _runtime_adoption_lock:
+        if terminal_id in _runtime_adopted_terminals:
+            return False
+
+        provider_manager.get_provider(terminal_id)
+
+        if not get_backend().supports_event_inbox():
+            session_name = metadata["tmux_session"]
+            window_name = metadata["tmux_window"]
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+            get_backend().stop_pipe_pane(session_name, window_name)
+            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+
+        history = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            tail_lines=PIPE_LIVENESS_TAIL_LINES,
+        )
+        status_monitor.seed_from_history(terminal_id, history)
+        _runtime_adopted_terminals.add(terminal_id)
+    return True
+
+
 def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
     """Replace a terminal's group array.
 
@@ -2941,6 +2992,8 @@ def dismantle_terminal_runtime(
     # temporary process race into a permanent private-home leak.
     if provider_manager.cleanup_provider(terminal_id) is False:
         return False
+    with _runtime_adoption_lock:
+        _runtime_adopted_terminals.discard(terminal_id)
     with _memory_injected_lock:
         _memory_injected_terminals.discard(terminal_id)
     # Drop any per-curator dispatch lock so the registry doesn't grow

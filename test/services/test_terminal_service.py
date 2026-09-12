@@ -5,11 +5,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.services.terminal_service import (
+    adopt_terminal_runtime,
     exit_terminal_cli,
     get_working_directory,
     list_siblings,
     send_special_key,
 )
+from cli_agent_orchestrator.services import terminal_service as terminal_service_mod
 
 
 def test_grok_uses_runtime_skills_with_native_tool_enforcement():
@@ -33,6 +35,50 @@ def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
 
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+class TestAdoptTerminalRuntime:
+    @patch(f"{_TS}.status_monitor")
+    @patch(f"{_TS}.fifo_manager")
+    @patch(f"{_TS}.provider_manager")
+    @patch(f"{_TS}.get_backend")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_adopt_terminal_runtime_reattaches_output_and_seeds_status(
+        self,
+        mock_get_metadata,
+        mock_get_backend,
+        mock_provider_manager,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        with terminal_service_mod._runtime_adoption_lock:
+            terminal_service_mod._runtime_adopted_terminals.discard("term1")
+        mock_get_metadata.return_value = {
+            "id": "term1",
+            "tmux_session": "cao-live",
+            "tmux_window": "chief-of-staff",
+            "provider": "mock_cli",
+            "agent_profile": "developer",
+        }
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.return_value = "mock> ready"
+        mock_get_backend.return_value = backend
+
+        assert adopt_terminal_runtime("term1") is True
+
+        mock_provider_manager.get_provider.assert_called_once_with("term1")
+        mock_fifo_manager.create_reader.assert_called_once()
+        backend.stop_pipe_pane.assert_called_once_with("cao-live", "chief-of-staff")
+        backend.pipe_pane.assert_called_once()
+        mock_status_monitor.seed_from_history.assert_called_once_with("term1", "mock> ready")
+
+        assert adopt_terminal_runtime("term1") is False
+        mock_provider_manager.get_provider.assert_called_once_with("term1")
+        mock_fifo_manager.create_reader.assert_called_once()
+        backend.stop_pipe_pane.assert_called_once_with("cao-live", "chief-of-staff")
+        backend.pipe_pane.assert_called_once()
+        mock_status_monitor.seed_from_history.assert_called_once_with("term1", "mock> ready")
 
 
 class TestTerminalServiceWorkingDirectory:

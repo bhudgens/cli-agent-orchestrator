@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    update_terminal_window,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -49,6 +50,112 @@ from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
+
+
+def _live_cao_sessions(backend: TerminalBackend) -> List[Dict[str, Any]]:
+    return [
+        s
+        for s in backend.list_sessions()
+        if (s.get("id") or "").startswith(SESSION_PREFIX)
+    ]
+
+
+def _window_zero_name(windows: List[Dict[str, Any]]) -> Optional[str]:
+    for window in windows:
+        if str(window.get("index")) == "0" and window.get("name"):
+            return str(window["name"])
+    return None
+
+
+def resync_live_terminals() -> Dict[str, List[str]]:
+    """Adopt live tmux terminals from durable rows after a server restart.
+
+    The reconciliation is conservative:
+    - exact live row/window matches are adopted as-is;
+    - a session's oldest row may be repaired to live window index 0, covering
+      the common conductor/supervisor rename from generated name to human name;
+    - rows for windows missing from an otherwise-live session are deleted so the
+      portal and control plane do not keep advertising unusable terminal ids.
+
+    No tmux session or window is killed or restarted.
+    """
+    report: Dict[str, List[str]] = {"adopted": [], "repaired": [], "pruned": [], "errors": []}
+    try:
+        backend = get_backend()
+        live_sessions = _live_cao_sessions(backend)
+    except Exception as exc:
+        logger.warning("Restart resync skipped: failed to list live sessions: %s", exc)
+        report["errors"].append(str(exc))
+        return report
+
+    if not live_sessions:
+        return report
+
+    live_session_names = [s["id"] for s in live_sessions if s.get("id")]
+    try:
+        rows_by_session = _terminals_grouped_by_session(live_session_names)
+    except Exception as exc:
+        logger.warning("Restart resync skipped: failed to list terminal rows: %s", exc)
+        report["errors"].append(str(exc))
+        return report
+
+    from cli_agent_orchestrator.services import terminal_service
+    from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+    for session_name in live_session_names:
+        try:
+            windows = backend.list_windows(session_name)
+        except Exception as exc:
+            logger.warning("Restart resync could not list windows for %s: %s", session_name, exc)
+            report["errors"].append(f"{session_name}: {exc}")
+            continue
+
+        live_window_names = {str(w["name"]) for w in windows if w.get("name")}
+        if not live_window_names:
+            continue
+
+        rows = rows_by_session.get(session_name, [])
+        used_live_windows = {
+            row["tmux_window"] for row in rows if row.get("tmux_window") in live_window_names
+        }
+        row_ids_to_prune: List[str] = []
+
+        for index, row in enumerate(rows):
+            terminal_id = row["id"]
+            current_window = row.get("tmux_window")
+            adopted = False
+
+            if current_window in live_window_names:
+                adopted = True
+            elif index == 0:
+                candidate = _window_zero_name(windows)
+                if candidate and candidate not in used_live_windows:
+                    if update_terminal_window(terminal_id, candidate):
+                        row["tmux_window"] = candidate
+                        used_live_windows.add(candidate)
+                        report["repaired"].append(terminal_id)
+                        adopted = True
+
+            if adopted:
+                try:
+                    if terminal_service.adopt_terminal_runtime(terminal_id):
+                        report["adopted"].append(terminal_id)
+                        inbox_service.deliver_pending(terminal_id)
+                except Exception as exc:
+                    logger.warning("Failed to adopt terminal %s: %s", terminal_id, exc)
+                    report["errors"].append(f"{terminal_id}: {exc}")
+            else:
+                row_ids_to_prune.append(terminal_id)
+
+        if row_ids_to_prune:
+            try:
+                delete_terminals_by_ids(row_ids_to_prune)
+                report["pruned"].extend(row_ids_to_prune)
+            except Exception as exc:
+                logger.warning("Failed to prune stale terminal rows for %s: %s", session_name, exc)
+                report["errors"].append(f"{session_name}: {exc}")
+
+    return report
 
 
 async def create_session(
@@ -237,17 +344,7 @@ def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
         backend = get_backend()
-        tmux_sessions = backend.list_sessions()
-        cao_sessions = [
-            s
-            for s in tmux_sessions
-            # Use .get() rather than s["id"]: a backend that returns a session
-            # dict without an "id" key must not blank the entire list (KeyError
-            # in this comprehension is swallowed by the outer except and returns
-            # []). Shipped backends always populate "id"; this hardens against a
-            # future backend that does not.
-            if (s.get("id") or "").startswith(SESSION_PREFIX)
-        ]
+        cao_sessions = _live_cao_sessions(backend)
         # Filter BEFORE the terminal read: it is what bounds the read to live
         # CAO sessions, and it keeps a host running only non-CAO tmux sessions
         # at zero queries, as it was when the read was per-session and therefore
@@ -279,6 +376,8 @@ def get_session(session_name: str) -> Dict:
     try:
         if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
+
+        resync_live_terminals()
 
         tmux_sessions = get_backend().list_sessions()
         session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
