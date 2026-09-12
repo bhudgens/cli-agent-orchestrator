@@ -28,6 +28,8 @@ from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+_CAO_RECOVERY_OPTION_PREFIX = "@cao-recovery-"
+_CAO_RECOVERY_OPTION_KEY_RE = re.compile(r"[a-z][a-z0-9_]*")
 
 
 class TmuxLookupError(RuntimeError):
@@ -1285,6 +1287,67 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to get windows for session {session_name}: {e}")
             return []
+
+    def set_window_metadata(
+        self, session_name: str, window_name: str, metadata: Dict[str, str]
+    ) -> None:
+        """Persist CAO recovery metadata as tmux per-window user options.
+
+        Tmux user options survive a cao-server process restart and are scoped
+        to one window, so they provide stronger identity evidence than a
+        generated window name.  Only keys produced by the recovery service
+        are accepted; rejecting arbitrary option names here also prevents a
+        future caller from accidentally changing a real tmux setting.
+        """
+        session = self._find_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        window = self._find_window(session, session_name, window_name)
+        if not window:
+            raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+        for key in metadata:
+            if not _CAO_RECOVERY_OPTION_KEY_RE.fullmatch(key):
+                raise ValueError(f"Invalid CAO window metadata key: {key!r}")
+
+        # CAO owns this prefix.  Remove a stale optional value when a terminal
+        # row is backfilled or updated, so a previous caller/profile does not
+        # survive in tmux and create a false recovery conflict later.
+        try:
+            existing_options = window.show_options()
+        except Exception:
+            existing_options = {}
+        for option in existing_options:
+            option_name = str(option)
+            if option_name.startswith(_CAO_RECOVERY_OPTION_PREFIX):
+                key = option_name[len(_CAO_RECOVERY_OPTION_PREFIX) :]
+                if key not in metadata:
+                    window.unset_option(option_name)
+
+        for key, value in metadata.items():
+            window.set_option(f"{_CAO_RECOVERY_OPTION_PREFIX}{key}", str(value))
+
+    def get_window_metadata(self, session_name: str, window_name: str) -> Dict[str, str]:
+        """Read CAO recovery metadata from one tmux window.
+
+        An empty mapping means the exact live window was read successfully but
+        has no CAO recovery options.  Lookup/option-read failures propagate so
+        restart resync can distinguish unreadable evidence from a successful
+        empty read and fail closed instead of trusting a stale manifest.
+        """
+        session = self._find_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        window = self._find_window(session, session_name, window_name)
+        if not window:
+            raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+        options = window.show_options()
+        recovery_options: Dict[str, str] = {}
+        for key, value in options.items():
+            option_name = str(key)
+            if option_name.startswith(_CAO_RECOVERY_OPTION_PREFIX):
+                recovery_options[option_name[len(_CAO_RECOVERY_OPTION_PREFIX) :]] = str(value)
+        return recovery_options
 
     def kill_session(self, session_name: str) -> bool:
         """Kill tmux session, returning True only once it is CONFIRMED gone.

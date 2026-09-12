@@ -350,3 +350,86 @@ class TestRestoreCommand:
         call_kwargs = mock_tmux.create_window.call_args[1]
         assert call_kwargs["window_shell"].startswith("exec ")
         assert call_kwargs["window_shell"].endswith(" -l")
+
+
+class TestAdoptCommand:
+    """Tests for the explicit live-window adoption command."""
+
+    def test_adopt_posts_explicit_identity(self, runner, tmp_path):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"id": "c8397e50"}
+        with patch(
+            "cli_agent_orchestrator.cli.commands.terminal.requests.post",
+            return_value=response,
+        ) as post:
+            result = runner.invoke(
+                terminal,
+                [
+                    "adopt",
+                    "--terminal-id",
+                    "c8397e50",
+                    "--session-name",
+                    "cao-live",
+                    "--window-name",
+                    "anchor-dev-new",
+                    "--provider",
+                    "codex",
+                    "--agent-profile",
+                    "developer",
+                    "--working-directory",
+                    str(tmp_path),
+                    "--caller-id",
+                    "5a88b9bb",
+                    "--allowed-tool",
+                    "read",
+                    "--metadata-json",
+                    '{"role":"anchor-dev"}',
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Adopted terminal c8397e50" in result.output
+        post.assert_called_once_with(
+            "http://127.0.0.1:9889/terminals/adopt",
+            json={
+                "terminal_id": "c8397e50",
+                "session_name": "cao-live",
+                "window_name": "anchor-dev-new",
+                "provider": "codex",
+                "agent_profile": "developer",
+                "working_directory": str(tmp_path),
+                "caller_id": "5a88b9bb",
+                "allowed_tools": ["read"],
+                "engine": None,
+                "shell_command": None,
+                "group": None,
+                "metadata": {"role": "anchor-dev"},
+            },
+            timeout=30,
+        )
+
+    def test_adopt_rejects_invalid_metadata_json(self, runner, tmp_path):
+        result = runner.invoke(
+            terminal,
+            [
+                "adopt",
+                "--terminal-id",
+                "c8397e50",
+                "--session-name",
+                "cao-live",
+                "--window-name",
+                "anchor-dev-new",
+                "--provider",
+                "codex",
+                "--agent-profile",
+                "developer",
+                "--working-directory",
+                str(tmp_path),
+                "--metadata-json",
+                "not-json",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "must be valid JSON" in result.output

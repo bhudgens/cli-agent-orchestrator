@@ -590,6 +590,68 @@ class TestGetSessionWindows:
         assert result == []
 
 
+class TestWindowRecoveryMetadata:
+    """Tmux user options preserve exact recovery identity across server restarts."""
+
+    def test_set_and_get_window_metadata(self, tmux):
+        mock_window = MagicMock()
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        mock_session.windows.get.return_value = mock_window
+        mock_window.show_options.return_value = {
+            "@cao-recovery-version": "1",
+            "@cao-recovery-terminal_id": "c8397e50",
+            "@cao-recovery-tmux_session": "cao-live",
+            "@cao-recovery-tmux_window": "anchor-dev-new",
+            "@cao-recovery-provider": "codex",
+            "unrelated-option": "ignored",
+        }
+
+        tmux.set_window_metadata(
+            "cao-live",
+            "anchor-dev-new",
+            {"version": "1", "terminal_id": "c8397e50"},
+        )
+        result = tmux.get_window_metadata("cao-live", "anchor-dev-new")
+
+        assert result == {
+            "version": "1",
+            "terminal_id": "c8397e50",
+            "tmux_session": "cao-live",
+            "tmux_window": "anchor-dev-new",
+            "provider": "codex",
+        }
+        assert mock_window.set_option.call_args_list == [
+            call("@cao-recovery-version", "1"),
+            call("@cao-recovery-terminal_id", "c8397e50"),
+        ]
+        assert mock_window.unset_option.call_args_list == [
+            call("@cao-recovery-tmux_session"),
+            call("@cao-recovery-tmux_window"),
+            call("@cao-recovery-provider"),
+        ]
+
+    def test_get_window_metadata_propagates_option_read_error(self, tmux):
+        mock_window = MagicMock()
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        mock_session.windows.get.return_value = mock_window
+        mock_window.show_options.side_effect = RuntimeError("tmux option read failed")
+
+        with pytest.raises(RuntimeError, match="tmux option read failed"):
+            tmux.get_window_metadata("cao-live", "anchor-dev-new")
+
+    def test_set_window_metadata_rejects_unsafe_key(self, tmux):
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        mock_session.windows.get.return_value = mock_window
+
+        with pytest.raises(ValueError, match="Invalid CAO window metadata key"):
+            tmux.set_window_metadata("cao-live", "anchor-dev-new", {"bad-key": "x"})
+        mock_window.set_option.assert_not_called()
+
+
 # ── kill_session ─────────────────────────────────────────────────────
 
 

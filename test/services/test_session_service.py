@@ -30,6 +30,10 @@ from cli_agent_orchestrator.services.session_service import (
     list_sessions,
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_recovery import (
+    build_recovery_metadata,
+    tmux_recovery_metadata,
+)
 
 
 class TestCreateSession:
@@ -938,8 +942,11 @@ class TestRestartResync:
     class _Backend:
         def __init__(self, windows_by_session):
             self.windows_by_session = windows_by_session
+            self.window_metadata_by_window = {}
             self.pipe_calls = []
             self.stop_pipe_calls = []
+            self.kill_session_calls = []
+            self.kill_window_calls = []
 
         def list_sessions(self):
             return [
@@ -949,6 +956,9 @@ class TestRestartResync:
 
         def list_windows(self, session_name):
             return self.windows_by_session[session_name]
+
+        def get_window_metadata(self, session_name, window_name):
+            return self.window_metadata_by_window.get((session_name, window_name), {})
 
         def session_exists(self, session_name):
             return session_name in self.windows_by_session
@@ -965,6 +975,14 @@ class TestRestartResync:
         def pipe_pane(self, session_name, window_name, file_path):
             self.pipe_calls.append((session_name, window_name, file_path))
 
+        def kill_session(self, session_name):
+            self.kill_session_calls.append(session_name)
+            return False
+
+        def kill_window(self, session_name, window_name):
+            self.kill_window_calls.append((session_name, window_name))
+            return False
+
     def _terminal_row(self, terminal_id: str, window_name: str, session_name: str = "cao-live"):
         db_mod.create_terminal(
             terminal_id=terminal_id,
@@ -974,6 +992,52 @@ class TestRestartResync:
             agent_profile="developer",
             working_directory="/workspace",
         )
+
+    def _recovery_record(self, working_directory, **overrides):
+        record = {
+            "terminal_id": "c8397e50",
+            "tmux_session": "cao-live",
+            "tmux_window": "anchor-dev-new",
+            "provider": "codex",
+            "agent_profile": "developer",
+            "working_directory": working_directory,
+            "caller_id": "5a88b9bb",
+            "allowed_tools": None,
+            "group": None,
+            "metadata": {"role": "anchor-dev"},
+        }
+        record.update(overrides)
+        return build_recovery_metadata(record)
+
+    def _patch_no_adoption(self, backend, monkeypatch):
+        adopt_calls = []
+        persist_calls = []
+        runtime_calls = []
+        delivered = []
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal",
+            lambda **kwargs: adopt_calls.append(kwargs),
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "_persist_recovery_metadata",
+            lambda record: persist_calls.append(record) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal_runtime",
+            lambda terminal_id: runtime_calls.append(terminal_id) or True,
+        )
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+        return adopt_calls, persist_calls, runtime_calls, delivered
 
     def _patch_runtime(self, monkeypatch):
         from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -1024,7 +1088,421 @@ class TestRestartResync:
         assert report["adopted"] == ["term1"]
         assert get_terminal_metadata("term1")["tmux_window"] == "chief-of-staff"
 
-    def test_resync_prunes_dead_window_row_without_killing_session(self, real_session_db, monkeypatch):
+    def test_resync_recovers_manifest_for_rowless_persistent_window(
+        self, real_session_db, monkeypatch, tmp_path
+    ):
+        """One exact manifest re-adopts an anchor-like window without killing it."""
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        recovery_record = {
+            "terminal_id": "c8397e50",
+            "tmux_session": "cao-live",
+            "tmux_window": "anchor-dev-new",
+            "provider": "codex",
+            "agent_profile": "developer",
+            "working_directory": str(tmp_path),
+            "caller_id": "5a88b9bb",
+            "allowed_tools": None,
+            "group": None,
+            "metadata": {"role": "anchor-dev", "persistence": "human-driven"},
+        }
+        adopt_calls = []
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            session_service_mod,
+            "list_recovery_manifests",
+            lambda: [recovery_record],
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal",
+            lambda **kwargs: adopt_calls.append(kwargs) or {"id": kwargs["terminal_id"]},
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == ["c8397e50"]
+        assert report["adopted"] == ["c8397e50"]
+        assert report["ambiguous"] == []
+        assert adopt_calls == [
+            {
+                "terminal_id": "c8397e50",
+                "session_name": "cao-live",
+                "window_name": "anchor-dev-new",
+                "provider": "codex",
+                "agent_profile": "developer",
+                "working_directory": str(tmp_path),
+                "caller_id": "5a88b9bb",
+                "allowed_tools": None,
+                "engine": None,
+                "shell_command": None,
+                "group": None,
+                "metadata": {"role": "anchor-dev", "persistence": "human-driven"},
+            }
+        ]
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_recovers_restricted_policy_from_tmux_only_metadata(
+        self, real_session_db, monkeypatch
+    ):
+        working_directory = str(Path(__file__).resolve().parents[2])
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        record = self._recovery_record(
+            working_directory,
+            allowed_tools=["read"],
+            group=["sailpoint"],
+            metadata={"role": "anchor-dev", "consumer": "sailpoint"},
+        )
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = tmux_recovery_metadata(
+            record
+        )
+        runtime_calls = []
+        delivered = []
+        persisted = []
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: [])
+        monkeypatch.setattr(
+            terminal_service,
+            "get_backend",
+            lambda: backend,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "_persist_recovery_metadata",
+            lambda metadata: persisted.append(metadata) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal_runtime",
+            lambda terminal_id: runtime_calls.append(terminal_id) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal",
+            lambda terminal_id: {"id": terminal_id},
+        )
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        monkeypatch.setattr(
+            inbox_service,
+            "deliver_pending",
+            lambda terminal_id: delivered.append(terminal_id),
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        row = get_terminal_metadata("c8397e50")
+        assert report["recovered"] == ["c8397e50"]
+        assert report["adopted"] == ["c8397e50"]
+        assert row["allowed_tools"] == ["read"]
+        assert row["group"] == ["sailpoint"]
+        assert row["metadata"] == {"role": "anchor-dev", "consumer": "sailpoint"}
+        assert persisted[0]["allowed_tools"] == ["read"]
+        assert runtime_calls == ["c8397e50"]
+        assert delivered == ["c8397e50"]
+
+        # The recovered policy must remain restricted at the existing discovery
+        # gate; a missing tmux field must never be reconstructed as unrestricted.
+        from cli_agent_orchestrator.mcp_server import server as mcp_server
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"allowed_tools": row["allowed_tools"]}
+        monkeypatch.setattr(mcp_server.requests, "get", lambda *args, **kwargs: response)
+        denied = mcp_server._require_discovery_marker("c8397e50", "list siblings")
+        assert denied is not None
+        assert "not granted" in denied["error"]
+        assert "discovery" in denied["error"]
+
+    def test_resync_refuses_tmux_only_recovery_when_policy_is_missing(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        values = tmux_recovery_metadata(
+            self._recovery_record(
+                str(Path(__file__).resolve().parents[2]),
+                allowed_tools=["read"],
+                group=["sailpoint"],
+            )
+        )
+        values.pop("allowed_tools")
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = values
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: [])
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["adopted"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_rejects_tmux_metadata_with_a_different_session(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = tmux_recovery_metadata(
+            self._recovery_record(
+                str(Path(__file__).resolve().parents[2]),
+                tmux_session="cao-other",
+            )
+        )
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: [])
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+
+    def test_resync_rejects_tmux_metadata_with_a_different_window(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = tmux_recovery_metadata(
+            self._recovery_record(
+                str(Path(__file__).resolve().parents[2]),
+                tmux_window="other-window",
+            )
+        )
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: [])
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+
+    def test_resync_rejects_same_terminal_id_at_another_manifest_coordinate(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = tmux_recovery_metadata(
+            self._recovery_record(str(Path(__file__).resolve().parents[2]))
+        )
+        old_coordinate_record = self._recovery_record(
+            str(Path(__file__).resolve().parents[2]),
+            tmux_session="cao-old",
+            tmux_window="old-window",
+        )
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(
+            session_service_mod,
+            "list_recovery_manifests",
+            lambda: [old_coordinate_record],
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+
+    def test_resync_rejects_cleared_group_against_stale_tmux_policy(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        manifest = self._recovery_record(
+            str(Path(__file__).resolve().parents[2]),
+            group=None,
+        )
+        stale_tmux_record = self._recovery_record(
+            str(Path(__file__).resolve().parents[2]),
+            group=["old-project"],
+        )
+        backend.window_metadata_by_window["cao-live", "anchor-dev-new"] = tmux_recovery_metadata(
+            stale_tmux_record
+        )
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(
+            session_service_mod,
+            "list_recovery_manifests",
+            lambda: [manifest],
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["adopted"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_fails_closed_when_tmux_metadata_cannot_be_read(
+        self, real_session_db, monkeypatch
+    ):
+        class UnreadableBackend(self._Backend):
+            def get_window_metadata(self, session_name, window_name):
+                raise RuntimeError("tmux option read failed")
+
+        backend = UnreadableBackend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        manifest = self._recovery_record(str(Path(__file__).resolve().parents[2]))
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(
+            session_service_mod,
+            "list_recovery_manifests",
+            lambda: [manifest],
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+
+    def test_resync_does_not_adopt_or_deliver_for_duplicate_live_window_names(
+        self, real_session_db, monkeypatch
+    ):
+        backend = self._Backend(
+            {
+                "cao-live": [
+                    {"name": "anchor-dev-new", "index": "1"},
+                    {"name": "anchor-dev-new", "index": "2"},
+                ]
+            }
+        )
+        manifest = self._recovery_record(str(Path(__file__).resolve().parents[2]))
+        adopt_calls, persist_calls, runtime_calls, delivered = self._patch_no_adoption(
+            backend, monkeypatch
+        )
+        monkeypatch.setattr(
+            session_service_mod,
+            "list_recovery_manifests",
+            lambda: [manifest],
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["adopted"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert get_terminal_metadata("c8397e50") is None
+        assert adopt_calls == []
+        assert persist_calls == []
+        assert runtime_calls == []
+        assert delivered == []
+        assert backend.pipe_calls == []
+        assert backend.stop_pipe_calls == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_does_not_auto_adopt_ambiguous_live_window(self, real_session_db, monkeypatch):
+        """Contradictory durable records leave a live window untouched."""
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        records = [
+            {
+                "terminal_id": "c8397e50",
+                "tmux_session": "cao-live",
+                "tmux_window": "anchor-dev-new",
+                "provider": "codex",
+                "agent_profile": "developer",
+                "working_directory": "/workspace",
+            },
+            {
+                "terminal_id": "deadbeef",
+                "tmux_session": "cao-live",
+                "tmux_window": "anchor-dev-new",
+                "provider": "codex",
+                "agent_profile": "reviewer",
+                "working_directory": "/workspace",
+            },
+        ]
+        adopt_calls = []
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: records)
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal",
+            lambda **kwargs: adopt_calls.append(kwargs),
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["adopted"] == []
+        assert report["ambiguous"] == ["cao-live:anchor-dev-new"]
+        assert adopt_calls == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_does_not_guess_rowless_anchor_window_without_metadata(
+        self, real_session_db, monkeypatch
+    ):
+        """A familiar window name alone is not enough to invent an identity."""
+        backend = self._Backend({"cao-live": [{"name": "anchor-dev-new", "index": "3"}]})
+        adopt_calls = []
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+        monkeypatch.setattr(session_service_mod, "list_recovery_manifests", lambda: [])
+        monkeypatch.setattr(
+            terminal_service,
+            "adopt_terminal",
+            lambda **kwargs: adopt_calls.append(kwargs),
+        )
+
+        report = session_service_mod.resync_live_terminals()
+
+        assert report["recovered"] == []
+        assert report["ambiguous"] == []
+        assert adopt_calls == []
+        assert backend.kill_session_calls == []
+        assert backend.kill_window_calls == []
+
+    def test_resync_prunes_dead_window_row_without_killing_session(
+        self, real_session_db, monkeypatch
+    ):
         self._terminal_row("live1", "developer-live")
         self._terminal_row("dead1", "reviewer-gone")
         backend = self._Backend({"cao-live": [{"name": "developer-live", "index": "0"}]})
