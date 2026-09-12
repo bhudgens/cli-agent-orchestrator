@@ -23,6 +23,7 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 """
 
 import logging
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -46,6 +47,13 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.terminal_recovery import (
+    delete_recovery_manifest,
+    list_recovery_manifests,
+    merge_recovery_metadata,
+    recovery_metadata_from_tmux,
+    recovery_policy_is_complete,
+)
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
@@ -67,6 +75,106 @@ def _window_zero_name(windows: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _recovery_manifests_by_window() -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+    """Index valid recovery manifests by their exact tmux coordinates.
+
+    A manifest is evidence for one named window, not a license to infer an
+    identity from a window-name convention.  Keeping all candidates in the
+    index (including duplicate coordinates) lets the resync path classify a
+    collision as ambiguous instead of silently choosing one.
+    """
+    by_window: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    try:
+        manifests = list_recovery_manifests()
+    except Exception as exc:
+        logger.warning("Restart resync could not list recovery manifests: %s", exc)
+        return by_window
+
+    for manifest in manifests:
+        session_name = manifest.get("tmux_session")
+        window_name = manifest.get("tmux_window")
+        if not session_name or not window_name:
+            continue
+        by_window.setdefault((str(session_name), str(window_name)), []).append(manifest)
+    return by_window
+
+
+def _recovery_candidate_for_window(
+    backend: TerminalBackend,
+    session_name: str,
+    window_name: str,
+    manifests_by_window: Dict[Tuple[str, str], List[Dict[str, Any]]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve one exact live window to one unambiguous recovery record.
+
+    The return value is ``(record, None)`` for one candidate, ``(None, None)``
+    when no durable evidence exists, and ``(None, reason)`` when evidence is
+    present but contradictory or incomplete.  In the latter case callers must
+    leave the tmux window untouched and surface the coordinate as ambiguous.
+    """
+    coordinate = (session_name, window_name)
+    candidates = list(manifests_by_window.get(coordinate, []))
+
+    # The index is keyed by coordinate, but the terminal id is another
+    # identity boundary.  A stale manifest for the same id at a different
+    # coordinate must not be silently overwritten by the current scan.
+    for candidate in candidates:
+        for other_coordinate, other_candidates in manifests_by_window.items():
+            if other_coordinate != coordinate and any(
+                record.get("terminal_id") == candidate.get("terminal_id")
+                for record in other_candidates
+            ):
+                return None, "terminal id is also recorded at a different coordinate"
+
+    for candidate in candidates:
+        if (
+            candidate.get("tmux_session") != session_name
+            or candidate.get("tmux_window") != window_name
+        ):
+            return None, "manifest recovery metadata coordinates do not match the scanned window"
+
+    getter = getattr(backend, "get_window_metadata", None)
+    tmux_values: Dict[str, Any] = {}
+    if callable(getter):
+        try:
+            raw_values = getter(session_name, window_name)
+            if raw_values:
+                tmux_values = dict(raw_values)
+        except Exception as exc:
+            return None, f"could not read tmux recovery metadata: {exc}"
+
+    if tmux_values:
+        tmux_record = recovery_metadata_from_tmux(tmux_values)
+        if tmux_record is None:
+            return None, "tmux recovery metadata is incomplete or invalid"
+        if (
+            tmux_record.get("tmux_session") != session_name
+            or tmux_record.get("tmux_window") != window_name
+        ):
+            return None, "tmux recovery metadata coordinates do not match the scanned window"
+        for other_coordinate, other_candidates in manifests_by_window.items():
+            if other_coordinate != coordinate and any(
+                record.get("terminal_id") == tmux_record.get("terminal_id")
+                for record in other_candidates
+            ):
+                return None, "terminal id is also recorded at a different coordinate"
+        if candidates:
+            merged = [merge_recovery_metadata(candidate, tmux_record) for candidate in candidates]
+            if any(candidate is None for candidate in merged):
+                return None, "manifest and tmux recovery metadata disagree"
+            candidates = [candidate for candidate in merged if candidate is not None]
+        else:
+            candidates.append(tmux_record)
+
+    if not candidates:
+        return None, None
+    if len(candidates) != 1:
+        return None, f"{len(candidates)} recovery records claim the same live window"
+    if not recovery_policy_is_complete(candidates[0]):
+        return None, "recovery policy is incomplete; refusing automatic adoption"
+    return candidates[0], None
+
+
 def resync_live_terminals() -> Dict[str, List[str]]:
     """Adopt live tmux terminals from durable rows after a server restart.
 
@@ -74,12 +182,24 @@ def resync_live_terminals() -> Dict[str, List[str]]:
     - exact live row/window matches are adopted as-is;
     - a session's oldest row may be repaired to live window index 0, covering
       the common conductor/supervisor rename from generated name to human name;
+    - one exact, durable recovery record can re-adopt a live window whose row is
+      missing; absent or contradictory evidence leaves that window untouched;
     - rows for windows missing from an otherwise-live session are deleted so the
       portal and control plane do not keep advertising unusable terminal ids.
 
-    No tmux session or window is killed or restarted.
+    No tmux session or window is killed, restarted, or renamed.  After a
+    successful adoption, the normal pending-inbox retry may deliver messages
+    that were already queued for that terminal; resync sends no new recovery
+    probe or operator input of its own.
     """
-    report: Dict[str, List[str]] = {"adopted": [], "repaired": [], "pruned": [], "errors": []}
+    report: Dict[str, List[str]] = {
+        "adopted": [],
+        "recovered": [],
+        "repaired": [],
+        "pruned": [],
+        "ambiguous": [],
+        "errors": [],
+    }
     try:
         backend = get_backend()
         live_sessions = _live_cao_sessions(backend)
@@ -90,6 +210,8 @@ def resync_live_terminals() -> Dict[str, List[str]]:
 
     if not live_sessions:
         return report
+
+    manifests_by_window = _recovery_manifests_by_window()
 
     live_session_names = [s["id"] for s in live_sessions if s.get("id")]
     try:
@@ -110,9 +232,16 @@ def resync_live_terminals() -> Dict[str, List[str]]:
             report["errors"].append(f"{session_name}: {exc}")
             continue
 
-        live_window_names = {str(w["name"]) for w in windows if w.get("name")}
+        window_names = [str(w["name"]) for w in windows if w.get("name")]
+        live_window_names = set(window_names)
         if not live_window_names:
             continue
+
+        duplicate_window_names = {
+            name for name, count in Counter(window_names).items() if count > 1
+        }
+        for window_name in sorted(duplicate_window_names):
+            report["ambiguous"].append(f"{session_name}:{window_name}")
 
         rows = rows_by_session.get(session_name, [])
         used_live_windows = {
@@ -125,11 +254,20 @@ def resync_live_terminals() -> Dict[str, List[str]]:
             current_window = row.get("tmux_window")
             adopted = False
 
+            # A duplicate live name is an ambiguous coordinate. Preserve any
+            # existing row, but do not reattach runtime or deliver inbox input
+            # against whichever duplicate libtmux happens to return first.
+            if current_window in duplicate_window_names:
+                continue
             if current_window in live_window_names:
                 adopted = True
             elif index == 0:
                 candidate = _window_zero_name(windows)
-                if candidate and candidate not in used_live_windows:
+                if (
+                    candidate
+                    and candidate not in duplicate_window_names
+                    and candidate not in used_live_windows
+                ):
                     if update_terminal_window(terminal_id, candidate):
                         row["tmux_window"] = candidate
                         used_live_windows.add(candidate)
@@ -151,9 +289,86 @@ def resync_live_terminals() -> Dict[str, List[str]]:
             try:
                 delete_terminals_by_ids(row_ids_to_prune)
                 report["pruned"].extend(row_ids_to_prune)
+                for terminal_id in row_ids_to_prune:
+                    try:
+                        delete_recovery_manifest(terminal_id)
+                    except (OSError, ValueError):
+                        # Older/test-only rows may not have an 8-character CAO
+                        # id and therefore cannot have a recovery manifest.
+                        # Their row cleanup is still complete.
+                        pass
             except Exception as exc:
                 logger.warning("Failed to prune stale terminal rows for %s: %s", session_name, exc)
                 report["errors"].append(f"{session_name}: {exc}")
+
+        # Rows are authoritative while they exist.  A live window with no row
+        # is eligible for automatic recovery only when one complete durable
+        # record identifies this exact session/window.  In particular, a
+        # window called ``anchor-dev-new`` without metadata is deliberately
+        # not guessed into a terminal id or profile.
+        for window in windows:
+            window_name = str(window.get("name")) if window.get("name") else ""
+            if (
+                not window_name
+                or window_name in used_live_windows
+                or window_name in duplicate_window_names
+            ):
+                continue
+
+            recovery_candidate, ambiguity = _recovery_candidate_for_window(
+                backend,
+                session_name,
+                window_name,
+                manifests_by_window,
+            )
+            if ambiguity is not None:
+                report["ambiguous"].append(f"{session_name}:{window_name}")
+                logger.warning(
+                    "Restart resync left live window %s:%s unadopted: %s",
+                    session_name,
+                    window_name,
+                    ambiguity,
+                )
+                continue
+            if recovery_candidate is None:
+                continue
+
+            terminal_id = recovery_candidate["terminal_id"]
+            try:
+                terminal_service.adopt_terminal(
+                    terminal_id=terminal_id,
+                    session_name=session_name,
+                    window_name=window_name,
+                    provider=recovery_candidate["provider"],
+                    agent_profile=recovery_candidate["agent_profile"],
+                    working_directory=recovery_candidate.get("working_directory"),
+                    caller_id=recovery_candidate.get("caller_id"),
+                    allowed_tools=recovery_candidate.get("allowed_tools"),
+                    engine=recovery_candidate.get("engine"),
+                    shell_command=recovery_candidate.get("shell_command"),
+                    group=recovery_candidate.get("group"),
+                    metadata=recovery_candidate.get("metadata"),
+                )
+            except Exception as exc:
+                # An existing row with this id, a path that no longer exists,
+                # or a provider/runtime failure is a recovery failure, not a
+                # reason to touch the still-live tmux window.
+                logger.warning(
+                    "Failed to recover terminal %s from live window %s:%s: %s",
+                    terminal_id,
+                    session_name,
+                    window_name,
+                    exc,
+                )
+                report["errors"].append(f"{terminal_id}: {exc}")
+                continue
+
+            used_live_windows.add(window_name)
+            report["recovered"].append(terminal_id)
+            # ``adopted`` means runtime plumbing was restored.  Keep the
+            # recovered id in that existing report bucket as well so callers
+            # that only know the pre-feature report still see it as usable.
+            report["adopted"].append(terminal_id)
 
     return report
 
@@ -647,6 +862,11 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 # retry handle and the retried delete_session owns the event —
                 # emitting now as well would double-fire on that retry.
                 torn_down.extend(row_delete_failed)
+                for terminal_id, _metadata in row_delete_failed:
+                    try:
+                        delete_recovery_manifest(terminal_id)
+                    except (OSError, ValueError):
+                        pass
 
             # Drop the per-session forwarded-env mapping (issue #248). Safe
             # even when no vars were forwarded — the helper is a no-op then.
