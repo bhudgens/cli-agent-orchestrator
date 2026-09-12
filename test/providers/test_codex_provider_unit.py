@@ -1161,6 +1161,190 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.ERROR
 
+    def test_get_status_unsupported_model_error_after_first_prompt(self):
+        """Codex model rejection after a prompt is reported as ERROR, not IDLE."""
+        output = (
+            "OpenAI Codex\n"
+            "› hi\n"
+            "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.\n"
+            "› \n"
+            "  gpt-6-luna max · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+
+    def test_get_status_from_screen_wrapped_unsupported_model_error(self):
+        """A wrapped rendered rejection sentence is still reported as ERROR."""
+        screen_lines = [
+            "OpenAI Codex",
+            "› hi",
+            "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT",
+            "account.",
+            "› ",
+            "  gpt-6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    def test_get_status_from_screen_wrap_after_codex_is_error(self):
+        """A rejection wrapped immediately after Codex is still ERROR."""
+        screen_lines = [
+            "OpenAI Codex",
+            "› hi",
+            "The 'gpt-6-luna' model is not supported when using Codex",
+            "with a ChatGPT account.",
+            "› ",
+            "  gpt-6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    @pytest.mark.parametrize(
+        "next_token",
+        [
+            "'gpt-6-luna'",
+            "model",
+            "is",
+            "not",
+            "supported",
+            "when",
+            "using",
+            "Codex",
+            "with",
+            "a",
+            "ChatGPT",
+            "account.",
+        ],
+    )
+    def test_get_status_from_screen_any_model_error_word_boundary_wrap_is_error(
+        self, next_token
+    ):
+        """Every word-boundary wrap in the rejection sentence remains ERROR."""
+        error = (
+            "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account."
+        )
+        wrapped_error = error.replace(f" {next_token}", f"\n{next_token}", 1)
+        screen_lines = [
+            "OpenAI Codex",
+            "› hi",
+            *wrapped_error.splitlines(),
+            "› ",
+            "  gpt-6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    def test_get_status_from_screen_decorated_unsupported_model_error(self):
+        """A rendered rejection sentence with a square prefix is still ERROR."""
+        screen_lines = [
+            "OpenAI Codex",
+            "› hi",
+            "■ The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.",
+            "› ",
+            "  gpt-6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    def test_get_status_assistant_quoting_unsupported_model_wording_is_not_error(self):
+        """Healthy assistant prose quoting a rejection sentence is not ERROR."""
+        output = (
+            "› Explain the unsupported model message\n"
+            "assistant: The quoted error is: The 'gpt-6-luna' model is not supported "
+            "when using Codex with a ChatGPT account.\n"
+            "› \n"
+            "  gpt-5.6-luna max · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_from_screen_assistant_quote_without_user_marker_is_not_error(self):
+        """Quoted rejection prose stays healthy after the user scrolls away."""
+        screen_lines = [
+            "• The error text is:",
+            "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.",
+            "› ",
+            "  gpt-5.6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize(
+        "error_rows",
+        [
+            [
+                "The 'gpt-6-luna' model is not supported when using Codex",
+                "with a ChatGPT account.",
+            ],
+            [
+                "■ The 'gpt-6-luna' model is not supported when using Codex",
+                "with a ChatGPT account.",
+            ],
+            [
+                "■ The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT "
+                "account."
+            ],
+        ],
+        ids=["wrapped", "wrapped_decorated", "decorated"],
+    )
+    def test_get_status_from_screen_no_user_provider_error_remains_error(self, error_rows):
+        """No user marker must not suppress a genuine provider rejection."""
+        screen_lines = [*error_rows, "› ", "  gpt-6-luna max · ~/project"]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    def test_get_status_model_metadata_failure_is_error_before_first_prompt(self):
+        """An unknown model warning is not mistaken for a healthy idle banner."""
+        output = (
+            "OpenAI Codex\n"
+            "Model metadata for 'gpt-6-luna' not found. Defaulting to fallback metadata.\n"
+            "› \n"
+            "  gpt-6-luna max · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+        assert provider.get_status_from_screen(output.splitlines()) == TerminalStatus.ERROR
+
+    def test_get_status_from_screen_wrapped_model_metadata_error_is_error(self):
+        """Metadata rejection wrapped after for remains ERROR."""
+        screen_lines = [
+            "OpenAI Codex",
+            "Model metadata for",
+            "'gpt-6-luna' not found. Defaulting to fallback metadata.",
+            "› ",
+            "  gpt-6-luna max · ~/project",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.ERROR
+
+    def test_get_status_corrected_luna_model_remains_idle(self):
+        """The corrected gpt-5.6-luna model is not classified as a failure."""
+        output = "OpenAI Codex\n› \n  gpt-5.6-luna max · ~/project\n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
     def test_get_status_idle_tui_with_status_bar(self):
         """Test IDLE detection with realistic TUI output (status bar after prompt)."""
         output = (
