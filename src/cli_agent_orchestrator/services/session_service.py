@@ -64,7 +64,7 @@ def _live_cao_sessions(backend: TerminalBackend) -> List[Dict[str, Any]]:
     return [
         s
         for s in backend.list_sessions()
-        if (s.get("id") or "").startswith(SESSION_PREFIX)
+        if (s.get("id") or "").startswith(SESSION_PREFIX) and s.get("id") != "cao-server-local"
     ]
 
 
@@ -175,17 +175,16 @@ def _recovery_candidate_for_window(
     return candidates[0], None
 
 
-def resync_live_terminals() -> Dict[str, List[str]]:
+def resync_live_terminals(*, dry_run: bool = False) -> Dict[str, List[str]]:
     """Adopt live tmux terminals from durable rows after a server restart.
 
     The reconciliation is conservative:
     - exact live row/window matches are adopted as-is;
-    - a session's oldest row may be repaired to live window index 0, covering
-      the common conductor/supervisor rename from generated name to human name;
     - one exact, durable recovery record can re-adopt a live window whose row is
       missing; absent or contradictory evidence leaves that window untouched;
-    - rows for windows missing from an otherwise-live session are deleted so the
-      portal and control plane do not keep advertising unusable terminal ids.
+    - unmatched rows are retained and reported; a renamed window is not proof
+      that its worker died. Window position is never used to infer identity.
+    - dry_run reports recoverable ids without changing rows or runtime plumbing.
 
     No tmux session or window is killed, restarted, or renamed.  After a
     successful adoption, the normal pending-inbox retry may deliver messages
@@ -199,6 +198,9 @@ def resync_live_terminals() -> Dict[str, List[str]]:
         "pruned": [],
         "ambiguous": [],
         "errors": [],
+        "candidates": [],
+        "unmanaged": [],
+        "stale": [],
     }
     try:
         backend = get_backend()
@@ -247,9 +249,8 @@ def resync_live_terminals() -> Dict[str, List[str]]:
         used_live_windows = {
             row["tmux_window"] for row in rows if row.get("tmux_window") in live_window_names
         }
-        row_ids_to_prune: List[str] = []
 
-        for index, row in enumerate(rows):
+        for row in rows:
             terminal_id = row["id"]
             current_window = row.get("tmux_window")
             adopted = False
@@ -261,45 +262,25 @@ def resync_live_terminals() -> Dict[str, List[str]]:
                 continue
             if current_window in live_window_names:
                 adopted = True
-            elif index == 0:
-                candidate = _window_zero_name(windows)
-                if (
-                    candidate
-                    and candidate not in duplicate_window_names
-                    and candidate not in used_live_windows
-                ):
-                    if update_terminal_window(terminal_id, candidate):
-                        row["tmux_window"] = candidate
-                        used_live_windows.add(candidate)
-                        report["repaired"].append(terminal_id)
-                        adopted = True
 
             if adopted:
+                if dry_run:
+                    report["candidates"].append(terminal_id)
+                    continue
                 try:
                     if terminal_service.adopt_terminal_runtime(terminal_id):
                         report["adopted"].append(terminal_id)
-                        inbox_service.deliver_pending(terminal_id)
+                        from cli_agent_orchestrator.services.callback_watchdog import (
+                            is_human_or_persistent_terminal,
+                        )
+
+                        if not is_human_or_persistent_terminal(row):
+                            inbox_service.deliver_pending(terminal_id)
                 except Exception as exc:
                     logger.warning("Failed to adopt terminal %s: %s", terminal_id, exc)
                     report["errors"].append(f"{terminal_id}: {exc}")
             else:
-                row_ids_to_prune.append(terminal_id)
-
-        if row_ids_to_prune:
-            try:
-                delete_terminals_by_ids(row_ids_to_prune)
-                report["pruned"].extend(row_ids_to_prune)
-                for terminal_id in row_ids_to_prune:
-                    try:
-                        delete_recovery_manifest(terminal_id)
-                    except (OSError, ValueError):
-                        # Older/test-only rows may not have an 8-character CAO
-                        # id and therefore cannot have a recovery manifest.
-                        # Their row cleanup is still complete.
-                        pass
-            except Exception as exc:
-                logger.warning("Failed to prune stale terminal rows for %s: %s", session_name, exc)
-                report["errors"].append(f"{session_name}: {exc}")
+                report["stale"].append(terminal_id)
 
         # Rows are authoritative while they exist.  A live window with no row
         # is eligible for automatic recovery only when one complete durable
@@ -331,9 +312,13 @@ def resync_live_terminals() -> Dict[str, List[str]]:
                 )
                 continue
             if recovery_candidate is None:
+                report["unmanaged"].append(f"{session_name}:{window_name}")
                 continue
 
             terminal_id = recovery_candidate["terminal_id"]
+            if dry_run:
+                report["candidates"].append(terminal_id)
+                continue
             try:
                 terminal_service.adopt_terminal(
                     terminal_id=terminal_id,
@@ -591,8 +576,6 @@ def get_session(session_name: str) -> Dict:
     try:
         if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
-
-        resync_live_terminals()
 
         tmux_sessions = get_backend().list_sessions()
         session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)

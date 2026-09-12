@@ -1076,7 +1076,9 @@ class TestRestartResync:
         assert adopted == ["term1"]
         assert delivered == ["term1"]
 
-    def test_resync_repairs_renamed_conductor_window_zero(self, real_session_db, monkeypatch):
+    def test_resync_retains_renamed_conductor_without_guessing_window_zero(
+        self, real_session_db, monkeypatch
+    ):
         self._terminal_row("term1", "code_supervisor-5d39")
         backend = self._Backend({"cao-live": [{"name": "chief-of-staff", "index": "0"}]})
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
@@ -1084,9 +1086,10 @@ class TestRestartResync:
 
         report = session_service_mod.resync_live_terminals()
 
-        assert report["repaired"] == ["term1"]
-        assert report["adopted"] == ["term1"]
-        assert get_terminal_metadata("term1")["tmux_window"] == "chief-of-staff"
+        assert report["repaired"] == []
+        assert report["adopted"] == []
+        assert report["stale"] == ["term1"]
+        assert get_terminal_metadata("term1")["tmux_window"] == "code_supervisor-5d39"
 
     def test_resync_recovers_manifest_for_rowless_persistent_window(
         self, real_session_db, monkeypatch, tmp_path
@@ -1196,10 +1199,14 @@ class TestRestartResync:
         assert report["adopted"] == ["c8397e50"]
         assert row["allowed_tools"] == ["read"]
         assert row["group"] == ["sailpoint"]
-        assert row["metadata"] == {"role": "anchor-dev", "consumer": "sailpoint"}
+        assert row["metadata"] == {
+            "role": "anchor-dev",
+            "consumer": "sailpoint",
+            "cao_recovery_hold": True,
+        }
         assert persisted[0]["allowed_tools"] == ["read"]
         assert runtime_calls == ["c8397e50"]
-        assert delivered == ["c8397e50"]
+        assert delivered == []
 
         # The recovered policy must remain restricted at the existing discovery
         # gate; a missing tmux field must never be reconstructed as unrestricted.
@@ -1500,7 +1507,7 @@ class TestRestartResync:
         assert backend.kill_session_calls == []
         assert backend.kill_window_calls == []
 
-    def test_resync_prunes_dead_window_row_without_killing_session(
+    def test_resync_retains_unmatched_window_row_without_killing_session(
         self, real_session_db, monkeypatch
     ):
         self._terminal_row("live1", "developer-live")
@@ -1512,8 +1519,9 @@ class TestRestartResync:
         report = session_service_mod.resync_live_terminals()
 
         assert report["adopted"] == ["live1"]
-        assert report["pruned"] == ["dead1"]
-        assert get_terminal_metadata("dead1") is None
+        assert report["pruned"] == []
+        assert report["stale"] == ["dead1"]
+        assert get_terminal_metadata("dead1") is not None
         assert adopted == ["live1"]
         assert delivered == ["live1"]
 
@@ -1562,6 +1570,7 @@ class TestRestartResync:
             lambda terminal_id: delivered.append(terminal_id),
         )
 
+        session_service_mod.resync_live_terminals()
         first = get_session("cao-live")
         second = get_session("cao-live")
 
@@ -1576,7 +1585,7 @@ class TestRestartResync:
         assert delivered == [terminal_id]
 
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
-    def test_get_session_reports_repaired_terminal_after_resync(
+    def test_get_session_preserves_original_coordinates_without_resync(
         self, mock_get_status, real_session_db, monkeypatch
     ):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -1590,7 +1599,7 @@ class TestRestartResync:
         result = get_session("cao-live")
 
         assert result["session"]["id"] == "cao-live"
-        assert result["terminals"][0]["tmux_window"] == "cao-assign-fix-supervisor"
+        assert result["terminals"][0]["tmux_window"] == "code_supervisor-5d39"
         assert result["terminals"][0]["status"] == "idle"
 
 

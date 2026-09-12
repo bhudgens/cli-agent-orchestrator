@@ -16,6 +16,23 @@ from cli_agent_orchestrator.cli.commands.terminal import terminal
 # ---------------------------------------------------------------------------
 
 
+class TestRecoveryCommand:
+    @patch("cli_agent_orchestrator.cli.commands.terminal.requests.post")
+    def test_preview_then_token_apply(self, post):
+        post.return_value.json.return_value = {"token": "preview-token", "windows": []}
+        runner = CliRunner()
+        preview = runner.invoke(terminal, ["recover", "--all", "--dry-run", "--format", "json"])
+        assert preview.exit_code == 0
+        assert json.loads(preview.output)["token"] == "preview-token"
+        assert post.call_args.args[0].endswith("/terminals/recovery/plan")
+        result = runner.invoke(
+            terminal, ["recover", "--apply", "preview-token", "--exact-only", "--hold-inbox"]
+        )
+        assert result.exit_code == 0
+        assert post.call_args.kwargs["json"] == {"token": "preview-token"}
+        assert "headers" in post.call_args.kwargs
+
+
 class TestSnapshotOnDelete:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -406,6 +423,7 @@ class TestAdoptCommand:
                 "group": None,
                 "metadata": {"role": "anchor-dev"},
             },
+            headers={},
             timeout=30,
         )
 

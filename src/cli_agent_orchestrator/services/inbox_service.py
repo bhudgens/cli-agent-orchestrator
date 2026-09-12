@@ -84,6 +84,7 @@ class InboxService:
         terminal_id: str,
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
+        observed_status: TerminalStatus | None = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -99,20 +100,32 @@ class InboxService:
         serialized per terminal (see __init__ for why that is load-bearing).
         """
         with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
+            self._deliver_pending_locked(terminal_id, num_messages, registry, observed_status)
 
     def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int,
         registry: PluginRegistry | None,
+        observed_status: TerminalStatus | None = None,
     ) -> None:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.services.callback_watchdog import (
+            is_human_or_persistent_terminal,
+        )
+
+        if is_human_or_persistent_terminal(get_terminal_metadata(terminal_id)):
+            return
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
 
-        status = status_monitor.get_status(terminal_id)
+        status = (
+            observed_status
+            if observed_status is not None
+            else status_monitor.get_status(terminal_id)
+        )
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or

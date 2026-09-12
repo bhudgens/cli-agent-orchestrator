@@ -23,7 +23,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
-from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import (
+    CALLBACK_TASK_TIMEOUT_SECONDS,
+    DATABASE_URL,
+    DB_DIR,
+    DEFAULT_PROVIDER,
+)
+from cli_agent_orchestrator.models.callback import (
+    ACTIVE_CALLBACK_TASK_STATES,
+    CallbackTaskState,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
@@ -128,6 +137,50 @@ class InboxModel(Base):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class WatchdogCheckModel(Base):
+    """Latest deterministic observations and durable one-shot mail claims."""
+
+    __tablename__ = "watchdog_checks"
+    key = Column(String, primary_key=True)
+    report_json = Column(Text, nullable=True)
+    claimed = Column(Boolean, nullable=False, default=False)
+
+
+class CallbackTaskModel(Base):
+    """Durable callback obligation created for a local assignment.
+
+    This table is intentionally independent from ``terminals`` and ``inbox``:
+    deleting a worker must leave enough history for the watchdog to explain
+    that the callback became undeliverable, while a callback message remains
+    ordinary inbox traffic. ``Base.metadata.create_all`` makes the ledger
+    available after a restart without a hand-edited live database migration.
+    """
+
+    __tablename__ = "callback_tasks"
+
+    id = Column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    worker_terminal_id = Column(String, nullable=False, index=True)
+    caller_terminal_id = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    deadline_at = Column(DateTime(timezone=True), nullable=False)
+    stale_after_at = Column(DateTime(timezone=True), nullable=False)
+    state = Column(
+        String,
+        nullable=False,
+        default=CallbackTaskState.ASSIGNED.value,
+        server_default=CallbackTaskState.ASSIGNED.value,
+        index=True,
+    )
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    last_observed_status = Column(String, nullable=True)
+    last_inspection = Column(Text, nullable=True)
+    output_fresh = Column(Boolean, nullable=True)
+    last_nudge_at = Column(DateTime(timezone=True), nullable=True)
+    nudge_count = Column(Integer, nullable=False, default=0, server_default="0")
+    callback_received_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
 
 
 class MemoryMetadataModel(Base):
@@ -1992,6 +2045,258 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
+
+
+def list_terminal_ids() -> List[str]:
+    """Enumerate registry identities without decoding consumer JSON fields."""
+    with SessionLocal() as db:
+        return [row[0] for row in db.query(TerminalModel.id).all()]
+
+
+def record_watchdog_check(key: str, report: Dict[str, Any]) -> None:
+    import json
+
+    with SessionLocal() as db:
+        row = db.get(WatchdogCheckModel, key)
+        if row is None:
+            row = WatchdogCheckModel(key=key)
+            db.add(row)
+        row.report_json = json.dumps(report, default=str)
+        db.commit()
+
+
+def list_watchdog_checks() -> List[Dict[str, Any]]:
+    import json
+
+    with SessionLocal() as db:
+        return [
+            json.loads(row.report_json)
+            for row in db.query(WatchdogCheckModel).all()
+            if row.report_json
+        ]
+
+
+def claim_inbox_watchdog_nudge(message_id: int) -> bool:
+    """One watchdog attempt per inbox message, even across server restarts."""
+    from sqlalchemy.exc import IntegrityError
+
+    with SessionLocal() as db:
+        db.add(WatchdogCheckModel(key=f"mail:{message_id}", claimed=True))
+        try:
+            db.commit()
+            return True
+        except IntegrityError:
+            db.rollback()
+            return False
+
+
+def _callback_task_to_dict(task: CallbackTaskModel) -> Dict[str, Any]:
+    """Convert a callback ledger row to the transport-neutral task shape."""
+
+    def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    return {
+        "id": task.id,
+        "worker_terminal_id": task.worker_terminal_id,
+        "caller_terminal_id": task.caller_terminal_id,
+        "created_at": as_utc(task.created_at),
+        "deadline_at": as_utc(task.deadline_at),
+        "stale_after_at": as_utc(task.stale_after_at),
+        "state": task.state,
+        "last_checked_at": as_utc(task.last_checked_at),
+        "last_observed_status": task.last_observed_status,
+        "last_inspection": task.last_inspection,
+        "output_fresh": task.output_fresh,
+        "last_nudge_at": as_utc(task.last_nudge_at),
+        "nudge_count": task.nudge_count or 0,
+        "callback_received_at": as_utc(task.callback_received_at),
+        "last_error": task.last_error,
+    }
+
+
+def create_callback_task(
+    worker_terminal_id: str,
+    caller_terminal_id: str,
+    *,
+    created_at: Optional[datetime] = None,
+    deadline_at: Optional[datetime] = None,
+    stale_after_at: Optional[datetime] = None,
+    stale_after_seconds: float = CALLBACK_TASK_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Create or reuse the active callback obligation for a worker.
+
+    The active-row lookup makes retrying the same terminal creation harmless,
+    while completed historical obligations remain available for inspection.
+    ``deadline_at`` and ``stale_after_at`` default to the same conservative
+    timeout because this MVP has no separate semantic-progress signal.
+    """
+    created = created_at or _utcnow()
+    deadline = deadline_at or (created + timedelta(seconds=stale_after_seconds))
+    stale_after = stale_after_at or deadline
+
+    with SessionLocal() as db:
+        existing = (
+            db.query(CallbackTaskModel)
+            .filter(
+                CallbackTaskModel.worker_terminal_id == worker_terminal_id,
+                CallbackTaskModel.caller_terminal_id == caller_terminal_id,
+                CallbackTaskModel.state.in_(ACTIVE_CALLBACK_TASK_STATES),
+            )
+            .order_by(CallbackTaskModel.created_at.desc())
+            .first()
+        )
+        if existing is not None:
+            return _callback_task_to_dict(existing)
+
+        task = CallbackTaskModel(
+            worker_terminal_id=worker_terminal_id,
+            caller_terminal_id=caller_terminal_id,
+            created_at=created,
+            deadline_at=deadline,
+            stale_after_at=stale_after,
+            state=CallbackTaskState.ASSIGNED.value,
+            nudge_count=0,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return _callback_task_to_dict(task)
+
+
+def get_callback_task(task_id: str) -> Optional[Dict[str, Any]]:
+    """Return one callback task by its durable id, if it exists."""
+    with SessionLocal() as db:
+        task = db.query(CallbackTaskModel).filter(CallbackTaskModel.id == task_id).first()
+        return _callback_task_to_dict(task) if task is not None else None
+
+
+def list_callback_tasks(*, active_only: bool = True) -> List[Dict[str, Any]]:
+    """List callback tasks in creation order for API/CLI inspection."""
+    with SessionLocal() as db:
+        query = db.query(CallbackTaskModel)
+        if active_only:
+            query = query.filter(CallbackTaskModel.state.in_(ACTIVE_CALLBACK_TASK_STATES))
+        tasks = query.order_by(CallbackTaskModel.created_at.asc()).all()
+        return [_callback_task_to_dict(task) for task in tasks]
+
+
+def mark_callback_received(
+    worker_terminal_id: str,
+    caller_terminal_id: str,
+    *,
+    received_at: Optional[datetime] = None,
+) -> bool:
+    """Close the newest matching obligation when a worker sends its callback."""
+    with SessionLocal() as db:
+        task = (
+            db.query(CallbackTaskModel)
+            .filter(
+                CallbackTaskModel.worker_terminal_id == worker_terminal_id,
+                CallbackTaskModel.caller_terminal_id == caller_terminal_id,
+                CallbackTaskModel.state != CallbackTaskState.CALLBACK_RECEIVED.value,
+            )
+            .order_by(CallbackTaskModel.created_at.desc())
+            .first()
+        )
+        if task is None:
+            return False
+
+        task.state = CallbackTaskState.CALLBACK_RECEIVED.value
+        task.callback_received_at = received_at or _utcnow()
+        task.last_error = None
+        db.commit()
+        return True
+
+
+def update_callback_task(task_id: str, **changes: Any) -> Optional[Dict[str, Any]]:
+    """Apply a narrow set of watchdog observations to a task row."""
+    allowed = {
+        "state",
+        "last_checked_at",
+        "last_observed_status",
+        "last_inspection",
+        "output_fresh",
+        "last_error",
+    }
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"Unsupported callback task fields: {sorted(unknown)}")
+
+    with SessionLocal() as db:
+        query = db.query(CallbackTaskModel).filter(CallbackTaskModel.id == task_id)
+        task = query.first()
+        if task is None:
+            return None
+
+        # The evaluator may have read a task just before the worker callback
+        # endpoint commits. Never let a stale watchdog observation resurrect a
+        # task that is already callback_received. The conditional UPDATE also
+        # closes the gap between this read and the commit across two sessions.
+        requested_state = changes.get("state")
+        if (
+            requested_state is not None
+            and requested_state != CallbackTaskState.CALLBACK_RECEIVED.value
+        ):
+            updated = query.filter(
+                CallbackTaskModel.state != CallbackTaskState.CALLBACK_RECEIVED.value
+            ).update(changes, synchronize_session=False)
+            if updated == 0:
+                db.rollback()
+                current = query.first()
+                return _callback_task_to_dict(current) if current is not None else None
+            db.commit()
+            current = query.first()
+            return _callback_task_to_dict(current) if current is not None else None
+
+        for field, value in changes.items():
+            setattr(task, field, value)
+        db.commit()
+        db.refresh(task)
+        return _callback_task_to_dict(task)
+
+
+def claim_callback_nudge(
+    task_id: str,
+    *,
+    nudged_at: Optional[datetime] = None,
+    max_nudges: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim one nudge slot for an overdue task.
+
+    The conditional UPDATE is the duplicate-nudge guard across concurrent
+    watchdog evaluations and process restarts. A claimed slot is retained even
+    if delivery later fails, giving the MVP at-most-once behavior.
+    """
+    if max_nudges <= 0:
+        return None
+    when = nudged_at or _utcnow()
+    with SessionLocal() as db:
+        updated = (
+            db.query(CallbackTaskModel)
+            .filter(
+                CallbackTaskModel.id == task_id,
+                CallbackTaskModel.state == CallbackTaskState.OVERDUE.value,
+                CallbackTaskModel.nudge_count < max_nudges,
+            )
+            .update(
+                {
+                    "nudge_count": CallbackTaskModel.nudge_count + 1,
+                    "last_nudge_at": when,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            db.rollback()
+            return None
+        db.commit()
+        task = db.query(CallbackTaskModel).filter(CallbackTaskModel.id == task_id).first()
+        return _callback_task_to_dict(task) if task is not None else None
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:

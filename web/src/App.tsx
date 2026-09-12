@@ -10,6 +10,7 @@ import { ProfilesPanel } from './components/ProfilesPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
 import { CaoMark } from './components/CaoMark'
+import { WatchdogAlerts } from './components/WatchdogAlerts'
 import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
 type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
@@ -141,6 +142,7 @@ export default function App() {
           </div>
         </div>
       </header>
+      <WatchdogAlerts />
 
       {/* Tab Bar */}
       <div className="border-b border-gray-800">

@@ -24,6 +24,7 @@ import click
 
 from cli_agent_orchestrator.utils.orchestration import (
     _assign_impl,
+    _callback_tasks_impl,
     _cancel_impl,
     _handoff_impl,
     _result_impl,
@@ -313,6 +314,22 @@ def result_cmd(terminal_id, as_json):
     supervisor would otherwise learn from a worker's send_message callback.
     """
     result = _result_impl(terminal_id)
+    if not _emit(result, as_json):
+        raise click.exceptions.Exit(1)
+
+
+@agent.command(name="callback-tasks")
+@click.option(
+    "--all",
+    "all_tasks",
+    is_flag=True,
+    default=False,
+    help="Include completed, failed, and undeliverable callback tasks.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def callback_tasks_cmd(all_tasks, as_json):
+    """List durable assignment callback states from cao-server."""
+    result = _callback_tasks_impl(active_only=not all_tasks)
     if not _emit(result, as_json):
         raise click.exceptions.Exit(1)
 

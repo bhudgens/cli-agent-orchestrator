@@ -463,6 +463,7 @@ export interface RunSummaryRow {
 }
 
 export const api = {
+  getWatchdog: () => fetchJSON<import('./components/WatchdogAlerts').WatchdogCheck[]>('/watchdog'),
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
   // Server-ranked search. Result order is the relevance ranking — render as-is.

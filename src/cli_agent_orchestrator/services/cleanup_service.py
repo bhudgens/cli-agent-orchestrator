@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
     InboxModel,
@@ -39,7 +40,25 @@ def cleanup_old_data():
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
             retained_terminal_ids: set[str] = set()
+            session_presence: dict[str, bool | None] = {}
             for terminal in old_terminals:
+                # Age measures activity, not process death. A quiet persistent
+                # worker can outlive retention and must keep its registry row.
+                # Preserve even renamed windows while their session survives;
+                # ambiguous/backend-error observations are not deletion proof.
+                session_name = terminal.tmux_session
+                if session_name not in session_presence:
+                    try:
+                        backend = get_backend()
+                        checker = getattr(backend, "session_exists_strict", None)
+                        session_presence[session_name] = (
+                            checker(session_name) if callable(checker) else None
+                        )
+                    except Exception:
+                        session_presence[session_name] = None
+                if session_presence[session_name] is not False:
+                    retained_terminal_ids.add(terminal.id)
+                    continue
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
                 # A stale Grok terminal can still own a private GROK_HOME. An
@@ -88,6 +107,8 @@ def cleanup_old_data():
         if TERMINAL_LOG_DIR.exists():
             for pattern in ("*.log", "*.scrollback", "*.snapshot.json"):
                 for log_file in TERMINAL_LOG_DIR.glob(pattern):
+                    if log_file.name.split(".", 1)[0] in retained_terminal_ids:
+                        continue
                     if log_file.stat().st_mtime < cutoff_date.timestamp():
                         log_file.unlink()
                         terminal_logs_deleted += 1

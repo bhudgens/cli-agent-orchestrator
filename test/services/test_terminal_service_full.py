@@ -177,6 +177,7 @@ class TestCreateTerminal:
         mock_confirm_started,
         mock_delete_terminals_by_session,
         tmp_path,
+        isolated_memory_db,
     ):
         """Verified deferred delivery initializes, sends, and confirms pickup
         before returning success, instead of scheduling a background task."""
@@ -208,6 +209,12 @@ class TestCreateTerminal:
         )
 
         assert result.status == TerminalStatus.PROCESSING
+        from cli_agent_orchestrator.clients.database import list_callback_tasks
+
+        tasks = list_callback_tasks()
+        assert len(tasks) == 1
+        assert tasks[0]["worker_terminal_id"] == "test1234"
+        assert tasks[0]["caller_terminal_id"] == "a1b2c3d4"
         mock_provider.initialize.assert_awaited_once()
         mock_send_input.assert_called_once_with(
             "test1234",

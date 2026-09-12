@@ -1808,6 +1808,36 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
         return {"success": False, "terminal_id": terminal_id, "error": str(e)}
 
 
+def _callback_tasks_impl(active_only: bool = True) -> Dict[str, Any]:
+    """List the server's durable assignment callback ledger."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/callback-tasks",
+            params={"active_only": str(bool(active_only)).lower()},
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {
+            "success": True,
+            "active_only": bool(active_only),
+            "tasks": response.json(),
+        }
+    except requests.HTTPError as exc:
+        detail = (
+            _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
+        )
+        return {"success": False, "active_only": bool(active_only), "error": detail}
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "active_only": bool(active_only),
+            "error": "Failed to connect to cao-server. The server may not be running.",
+        }
+    except Exception as e:
+        return {"success": False, "active_only": bool(active_only), "error": str(e)}
+
+
 def _result_impl(terminal_id: str) -> Dict[str, Any]:
     """Fetch a terminal's last response (the tail of its most recent turn).
 

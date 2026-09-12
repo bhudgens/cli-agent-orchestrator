@@ -1455,6 +1455,35 @@ async def create_terminal(
                             "model": model or (profile.model if profile else None),
                         }
                     )
+
+                    # Local assign is the one terminal-create path that owns a
+                    # durable callback obligation. Register it after the
+                    # terminal row commits and before provider initialization,
+                    # so a very fast worker cannot callback before its ledger
+                    # row exists. The watchdog is a best-effort sidecar: a
+                    # schema/DB outage must not strand the newly-created tmux
+                    # worker or change the existing assign response contract.
+                    if (
+                        caller_id
+                        and initial_message is not None
+                        and (
+                            initial_message_orchestration_type == OrchestrationType.ASSIGN
+                            or str(initial_message_orchestration_type).lower()
+                            == OrchestrationType.ASSIGN.value
+                        )
+                    ):
+                        try:
+                            from cli_agent_orchestrator.services.callback_watchdog import (
+                                callback_watchdog,
+                            )
+
+                            callback_watchdog.register_assignment(terminal_id, caller_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "Callback watchdog could not register assignment for %s: %s",
+                                terminal_id,
+                                exc,
+                            )
                 except BaseException:
                     _roll_back_backend_create_locked(
                         session_name,
@@ -1552,11 +1581,9 @@ async def create_terminal(
                 session_name,
                 window_name,
             )
-            if (
-                actual_working_directory is None
-                or os.path.realpath(actual_working_directory)
-                != os.path.realpath(resolved_working_directory)
-            ):
+            if actual_working_directory is None or os.path.realpath(
+                actual_working_directory
+            ) != os.path.realpath(resolved_working_directory):
                 raise RuntimeError(
                     "worker cwd verification failed: "
                     f"expected {resolved_working_directory!r}, got {actual_working_directory!r}"
@@ -1632,9 +1659,7 @@ async def create_terminal(
         initial_status = (
             TerminalStatus.PROCESSING
             if defer_init and verify_initial_delivery and initial_message
-            else TerminalStatus.UNKNOWN
-            if defer_init
-            else TerminalStatus.IDLE
+            else TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
         )
         terminal = Terminal(
             id=terminal_id,
@@ -2339,15 +2364,13 @@ def adopt_terminal_runtime(terminal_id: str) -> bool:
     if not metadata:
         return False
 
-    # Backfill the durable identity for rows created before restart adoption
-    # shipped.  This does not touch the pane and is intentionally best-effort;
-    # the runtime path below can still restore a row whose filesystem mirror is
-    # temporarily unavailable.
-    ensure_terminal_recovery_metadata(terminal_id, metadata)
-
     with _runtime_adoption_lock:
         if terminal_id in _runtime_adopted_terminals:
             return False
+
+        # Backfill once per runtime, not on every dashboard poll. Metadata
+        # updates persist their own changes through the explicit update paths.
+        ensure_terminal_recovery_metadata(terminal_id, metadata)
 
         provider_manager.get_provider(terminal_id)
 
@@ -2390,6 +2413,8 @@ def adopt_terminal(
     shell_command: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    hold_inbox: bool = True,
+    expected_pane_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Adopt one explicitly identified live tmux window into CAO.
 
@@ -2452,6 +2477,11 @@ def adopt_terminal(
                 f"window name '{window_name}' is ambiguous: "
                 f"{len(matching_windows)} live windows match"
             )
+        if (
+            expected_pane_id is not None
+            and backend.get_pane_id(session_name, window_name) != expected_pane_id
+        ):
+            raise TerminalAdoptionConflict("Live pane changed since recovery preview")
 
         if working_directory is None:
             working_directory = backend.get_pane_working_directory(session_name, window_name)
@@ -2499,6 +2529,9 @@ def adopt_terminal(
                         f"window '{window_name}' is already mapped to terminal '{row['id']}'"
                     )
 
+            if hold_inbox:
+                record["metadata"] = {**(record.get("metadata") or {}), "cao_recovery_hold": True}
+
             db_create_terminal(
                 terminal_id=record["terminal_id"],
                 tmux_session=record["tmux_session"],
@@ -2514,6 +2547,14 @@ def adopt_terminal(
                 working_directory=record["working_directory"],
             )
 
+        if existing:
+            # Preserve policy from the existing row, never replace it with
+            # omitted/default fields from an idempotent adoption request.
+            record = build_recovery_metadata(existing)
+            if hold_inbox:
+                record["metadata"] = {**(record.get("metadata") or {}), "cao_recovery_hold": True}
+                update_terminal_metadata(terminal_id, record["metadata"])
+
         # Persist to both recovery stores before runtime registration. If the
         # file/backend mirror is unavailable, the row and explicit adoption
         # still remain usable; the warning is emitted by the helper and the
@@ -2525,9 +2566,15 @@ def adopt_terminal(
         # terminal is still a valid idempotent success for this operation.
         adopt_terminal_runtime(terminal_id)
 
+        from cli_agent_orchestrator.services.callback_watchdog import (
+            is_human_or_persistent_terminal,
+        )
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
-        inbox_service.deliver_pending(terminal_id)
+        if not hold_inbox and not is_human_or_persistent_terminal(
+            get_terminal_metadata(terminal_id)
+        ):
+            inbox_service.deliver_pending(terminal_id)
 
     return get_terminal(terminal_id)
 

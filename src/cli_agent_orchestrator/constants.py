@@ -315,6 +315,19 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Assignment callback watchdog. The watchdog is deliberately slow and bounded:
+# it is a durable safety net for missing callbacks, not a second status poller.
+# Values are read at import time, matching the other server tuning constants.
+CALLBACK_WATCHDOG_INTERVAL_SECONDS = _env_positive_float(
+    "CAO_CALLBACK_WATCHDOG_INTERVAL_SECONDS", 30.0
+)
+CALLBACK_TASK_TIMEOUT_SECONDS = _env_positive_float("CAO_CALLBACK_TASK_TIMEOUT_SECONDS", 300.0)
+CALLBACK_WATCHDOG_MAX_NUDGES = max(0, _env_int("CAO_CALLBACK_WATCHDOG_MAX_NUDGES", 1))
+# Short aliases keep call sites readable and make the configuration vocabulary
+# discoverable without duplicating the environment-variable parsing.
+CALLBACK_WATCHDOG_INTERVAL = CALLBACK_WATCHDOG_INTERVAL_SECONDS
+CALLBACK_TASK_TIMEOUT = CALLBACK_TASK_TIMEOUT_SECONDS
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

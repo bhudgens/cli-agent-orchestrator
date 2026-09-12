@@ -10,6 +10,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import API_BASE_URL, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.utils.orchestration import _auth_headers
 from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
 
 
@@ -84,6 +85,44 @@ def restore(terminal_id: str):
     )
     if working_directory:
         click.echo(f"Working directory: {working_directory}")
+
+
+@terminal.command("recover")
+@click.option("--apply", "token", default=None, help="Apply an unexpired preview token")
+@click.option("--all", "all_sessions", is_flag=True, help="Scan all CAO sessions (the default)")
+@click.option("--dry-run", is_flag=True, help="Preview only (the default)")
+@click.option("--exact-only", is_flag=True, help="Require exact evidence (always enforced)")
+@click.option("--hold-inbox", is_flag=True, help="Hold recovered inboxes (always enforced)")
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+@click.option("--json", "as_json", is_flag=True, help="Print the structured recovery report")
+def recover(token, all_sessions, dry_run, exact_only, hold_inbox, output_format, as_json) -> None:
+    """Bring discoverable live CAO windows back under management.
+
+    Unmanaged or ambiguous windows are reported for explicit `terminal adopt`;
+    no identities are guessed and no sessions are restarted.
+    """
+    if token and dry_run:
+        raise click.UsageError("--dry-run cannot be combined with --apply")
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/recovery/{'apply' if token else 'plan'}",
+            json={"token": token} if token else None,
+            headers=_auth_headers(),
+            timeout=120,
+        )
+        response.raise_for_status()
+        report = response.json()
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        raise click.ClickException(f"Recovery request failed: {exc}") from exc
+    if as_json or output_format == "json":
+        click.echo(json.dumps(report, indent=2))
+    else:
+        click.echo("Recovery applied; inboxes held" if token else "Recovery preview")
+        click.echo(json.dumps(report, indent=2))
+        if not token:
+            click.echo(
+                f"Apply: cao terminal recover --apply {report['token']} --exact-only --hold-inbox"
+            )
 
 
 @terminal.command("adopt")
@@ -164,6 +203,7 @@ def adopt(
         response = requests.post(
             f"{API_BASE_URL}/terminals/adopt",
             json=body,
+            headers=_auth_headers(),
             timeout=30,
         )
     except requests.exceptions.ConnectionError as exc:

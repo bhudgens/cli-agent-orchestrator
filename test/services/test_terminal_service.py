@@ -154,7 +154,7 @@ class TestAdoptTerminal:
         assert row["working_directory"] == str(tmp_path)
         assert runtime_calls[0][0] == "metadata"
         assert runtime_calls[1] == ("runtime", "c8397e50")
-        assert delivered == ["c8397e50"]
+        assert delivered == []
         assert backend.kill_session_calls == []
         assert backend.kill_window_calls == []
 

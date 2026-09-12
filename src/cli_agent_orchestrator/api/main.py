@@ -138,6 +138,7 @@ from cli_agent_orchestrator.services.agent_step import (
     resolve_effective_working_directory,
     run_agent_step,
 )
+from cli_agent_orchestrator.services.callback_watchdog import callback_watchdog
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -1307,11 +1308,16 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    callback_watchdog_task = asyncio.create_task(callback_watchdog.run())
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     from cli_agent_orchestrator.services.session_service import resync_live_terminals
 
-    asyncio.create_task(asyncio.to_thread(resync_live_terminals))
+    # Rehydrate only exact existing registrations; rowless adoption is an
+    # explicit operator plan/apply operation, never a side effect of a GET.
+    from cli_agent_orchestrator.services.terminal_recovery_plan import restore_registered_terminals
+
+    asyncio.create_task(asyncio.to_thread(restore_registered_terminals))
 
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
@@ -1381,6 +1387,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    callback_watchdog_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1396,6 +1403,7 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            callback_watchdog_task,
             daemon_task,
             return_exceptions=True,
         )
@@ -3412,6 +3420,35 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
         )
+
+
+@app.post("/terminals/recovery/plan")
+async def plan_terminal_recovery_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    from cli_agent_orchestrator.services.terminal_recovery_plan import plan_recovery
+
+    return await asyncio.to_thread(plan_recovery)
+
+
+class ApplyRecoveryRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/terminals/recovery/apply")
+async def apply_terminal_recovery_endpoint(
+    body: ApplyRecoveryRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    from cli_agent_orchestrator.services.terminal_recovery_plan import (
+        RecoveryPlanConflict,
+        apply_recovery,
+    )
+
+    try:
+        return await asyncio.to_thread(apply_recovery, body.token)
+    except RecoveryPlanConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/terminals/adopt", response_model=Terminal)
@@ -6709,6 +6746,21 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
+    # A worker callback is ordinary inbox traffic. Match it by both endpoint
+    # identities before delivery so a callback that arrives immediately after
+    # a nudge closes the durable obligation and prevents another reminder.
+    try:
+        await asyncio.to_thread(
+            callback_watchdog.record_callback,
+            sender_id,
+            receiver_id,
+        )
+    except Exception as e:
+        # Callback tracking must not make a healthy inbox delivery fail; the
+        # watchdog remains able to explain the ledger/database error on its
+        # next sweep.
+        logger.warning("Callback watchdog could not record callback from %s: %s", sender_id, e)
+
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
@@ -6728,6 +6780,36 @@ async def create_inbox_message_endpoint(
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
     }
+
+
+@app.get("/watchdog")
+async def watchdog_report_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    from cli_agent_orchestrator.clients.database import list_watchdog_checks
+
+    return await asyncio.to_thread(list_watchdog_checks)
+
+
+@app.get("/callback-tasks")
+async def list_callback_tasks_endpoint(
+    active_only: bool = Query(
+        default=True,
+        description="Return assigned, picked-up, and overdue tasks only unless false.",
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List durable assignment callback obligations for operators and CLIs."""
+    try:
+        return await asyncio.to_thread(
+            callback_watchdog.list_tasks,
+            active_only=active_only,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list callback tasks: {str(e)}",
+        )
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")

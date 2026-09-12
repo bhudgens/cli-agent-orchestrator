@@ -13,6 +13,14 @@ from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 class TestCleanupOldData:
     """Tests for cleanup_old_data function."""
 
+    @pytest.fixture(autouse=True)
+    def absent_backend(self, monkeypatch):
+        backend = MagicMock()
+        backend.session_exists_strict.return_value = False
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.cleanup_service.get_backend", lambda: backend
+        )
+
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
