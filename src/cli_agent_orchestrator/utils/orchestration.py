@@ -92,6 +92,7 @@ TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 # defer_init=True); this is the first caller of that path, so it gets its own
 # padded timeout rather than silently inheriting one sized for something else.
 _HANDOFF_CREATE_TIMEOUT_S = 150.0
+_ASSIGN_VERIFIED_CREATE_TIMEOUT_S = 150.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -393,6 +394,7 @@ def _create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    verify_initial_delivery: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
@@ -418,7 +420,8 @@ def _create_terminal(
             returns in <2s by design) but too short for a SYNCHRONOUS create
             that waits out ``provider.initialize()`` (up to ~45s) -- pass an
             explicit, larger value for that case (see
-            ``_HANDOFF_CREATE_TIMEOUT_S``).
+            ``_HANDOFF_CREATE_TIMEOUT_S`` /
+            ``_ASSIGN_VERIFIED_CREATE_TIMEOUT_S``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -520,6 +523,8 @@ def _create_terminal(
         json_body = None
         if defer_init:
             params["defer_init"] = "true"
+            if verify_initial_delivery:
+                params["verify_initial_delivery"] = "true"
             json_body = {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
@@ -1567,8 +1572,10 @@ def _assign_impl(
             defer_init=True,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
+            verify_initial_delivery=True,
             model=model,
             use_worktree=use_worktree,
+            create_timeout=_ASSIGN_VERIFIED_CREATE_TIMEOUT_S,
         )
 
         return {
@@ -1576,8 +1583,7 @@ def _assign_impl(
             "terminal_id": terminal_id,
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
-                f"Worker is initializing in the background; your task will be "
-                f"delivered once it is ready. "
+                f"Worker accepted the initial task and is running. "
                 f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
                 + _get_cleanup_nudge()
             ),

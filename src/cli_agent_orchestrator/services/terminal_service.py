@@ -662,6 +662,7 @@ async def create_terminal(
     env_vars: Optional[dict[str, str]] = None,
     caller_id: Optional[str] = None,
     defer_init: bool = False,
+    verify_initial_delivery: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     engine: Optional[KiroEngine | str] = None,
@@ -702,6 +703,10 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        verify_initial_delivery: When used with ``defer_init`` and an initial
+            message, initialize the provider and confirm the message was picked
+            up before returning. Failures raise so the create endpoint can
+            return a visible non-success result.
         engine: Explicit Kiro engine. For Kiro, it must agree with the selected
             profile's engine when both are present; omitted resolves to v2.
         kiro_capability_probe: Optional test seam for the bounded wrapper probe.
@@ -1406,6 +1411,21 @@ async def create_terminal(
             resume_session_id=resume_session_id,
         )
 
+        if verify_initial_delivery:
+            actual_working_directory = get_backend().get_pane_working_directory(
+                session_name,
+                window_name,
+            )
+            if (
+                actual_working_directory is None
+                or os.path.realpath(actual_working_directory)
+                != os.path.realpath(resolved_working_directory)
+            ):
+                raise RuntimeError(
+                    "worker cwd verification failed: "
+                    f"expected {resolved_working_directory!r}, got {actual_working_directory!r}"
+                )
+
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
         # send runs as a background task, so two concurrent assigns can each
@@ -1414,14 +1434,47 @@ async def create_terminal(
         # took long enough to push the round-trip past that cap; deferring init
         # keeps the tool call under 2s.
         if defer_init:
-            shell_command = None  # unknown until initialize() runs
-            _schedule_deferred_init(
-                provider_instance,
-                terminal_id,
-                initial_message,
-                initial_message_orchestration_type,
-                registry,
-            )
+            if verify_initial_delivery:
+                await provider_instance.initialize()
+                shell_command = provider_instance.shell_baseline
+                if not isinstance(shell_command, str):
+                    shell_command = None
+                if shell_command:
+                    update_terminal_shell_command(terminal_id, shell_command)
+                if initial_message:
+                    effective_orchestration_type = (
+                        initial_message_orchestration_type or OrchestrationType.ASSIGN
+                    )
+                    await asyncio.to_thread(
+                        send_input,
+                        terminal_id,
+                        initial_message,
+                        registry=registry,
+                        sender_id=caller_id,
+                        orchestration_type=effective_orchestration_type,
+                    )
+                    started = await _confirm_worker_started_or_resubmit(
+                        terminal_id,
+                        initial_message,
+                        registry,
+                        caller_id,
+                        effective_orchestration_type,
+                        provider=provider_instance,
+                    )
+                    if not started:
+                        raise TimeoutError(
+                            f"Initial message delivery to terminal {terminal_id} "
+                            "could not be verified after retries"
+                        )
+            else:
+                shell_command = None  # unknown until initialize() runs
+                _schedule_deferred_init(
+                    provider_instance,
+                    terminal_id,
+                    initial_message,
+                    initial_message_orchestration_type,
+                    registry,
+                )
         else:
             await provider_instance.initialize()
 
@@ -1438,7 +1491,13 @@ async def create_terminal(
         # can't mistake it for ready and send input early. Callers poll
         # GET /terminals/{id} for the live status once init completes. The
         # synchronous path has already reached IDLE by here.
-        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
+        initial_status = (
+            TerminalStatus.PROCESSING
+            if defer_init and verify_initial_delivery and initial_message
+            else TerminalStatus.UNKNOWN
+            if defer_init
+            else TerminalStatus.IDLE
+        )
         terminal = Terminal(
             id=terminal_id,
             name=window_name,

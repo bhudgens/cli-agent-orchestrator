@@ -663,6 +663,7 @@ async def run_agent_step(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            verify_initial_delivery=True,
         )
         terminal_id = terminal.id
 

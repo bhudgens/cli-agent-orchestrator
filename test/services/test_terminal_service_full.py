@@ -147,6 +147,206 @@ class TestCreateTerminal:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_create_terminal_verified_deferred_delivery_waits_for_pickup(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_schedule_deferred_init,
+        mock_send_input,
+        mock_confirm_started,
+        mock_delete_terminals_by_session,
+        tmp_path,
+    ):
+        """Verified deferred delivery initializes, sends, and confirms pickup
+        before returning success, instead of scheduling a background task."""
+        workdir = tmp_path / "repo-a"
+        workdir.mkdir()
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_tmux.get_pane_working_directory.return_value = str(workdir)
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.shell_baseline = "codex"
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        mock_confirm_started.return_value = True
+
+        result = await create_terminal(
+            "codex",
+            "developer",
+            session_name="cao-existing",
+            working_directory=str(workdir),
+            caller_id="a1b2c3d4",
+            defer_init=True,
+            verify_initial_delivery=True,
+            initial_message="Do the work",
+            initial_message_orchestration_type=OrchestrationType.ASSIGN,
+        )
+
+        assert result.status == TerminalStatus.PROCESSING
+        mock_provider.initialize.assert_awaited_once()
+        mock_send_input.assert_called_once_with(
+            "test1234",
+            "Do the work",
+            registry=None,
+            sender_id="a1b2c3d4",
+            orchestration_type=OrchestrationType.ASSIGN,
+        )
+        mock_confirm_started.assert_awaited_once_with(
+            "test1234",
+            "Do the work",
+            None,
+            "a1b2c3d4",
+            OrchestrationType.ASSIGN,
+            provider=mock_provider,
+        )
+        mock_schedule_deferred_init.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_create_terminal_verified_delivery_fails_on_cwd_mismatch(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_schedule_deferred_init,
+        mock_delete_terminals_by_session,
+        tmp_path,
+    ):
+        """A worker in server cwd B instead of requested cwd A fails visibly."""
+        expected_workdir = tmp_path / "repo-a"
+        actual_workdir = tmp_path / "repo-b"
+        expected_workdir.mkdir()
+        actual_workdir.mkdir()
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_tmux.get_pane_working_directory.return_value = str(actual_workdir)
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        with pytest.raises(RuntimeError, match="worker cwd verification failed"):
+            await create_terminal(
+                "codex",
+                "developer",
+                session_name="cao-existing",
+                working_directory=str(expected_workdir),
+                defer_init=True,
+                verify_initial_delivery=True,
+                initial_message="Do the work",
+            )
+
+        mock_provider.initialize.assert_not_awaited()
+        mock_schedule_deferred_init.assert_not_called()
+        mock_tmux.kill_window.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_create_terminal_synchronous_verification_fails_on_cwd_mismatch(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        tmp_path,
+    ):
+        """Synchronous run-step/handoff creates use the same cwd verification:
+        same session, requested cwd A, actual worker cwd B, visible failure."""
+        expected_workdir = tmp_path / "repo-a"
+        actual_workdir = tmp_path / "repo-b"
+        expected_workdir.mkdir()
+        actual_workdir.mkdir()
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_tmux.get_pane_working_directory.return_value = str(actual_workdir)
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        with pytest.raises(RuntimeError, match="worker cwd verification failed"):
+            await create_terminal(
+                "codex",
+                "developer",
+                session_name="cao-existing",
+                new_session=False,
+                working_directory=str(expected_workdir),
+                verify_initial_delivery=True,
+            )
+
+        mock_tmux.create_window.assert_called_once()
+        assert mock_tmux.create_window.call_args.args[0] == "cao-existing"
+        mock_provider.initialize.assert_not_awaited()
+        mock_tmux.kill_window.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
