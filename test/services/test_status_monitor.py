@@ -42,6 +42,52 @@ class TestGetStatusTmux:
 
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
 
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_processing_terminal_is_rehydrated_from_live_pane(
+        self, mock_get_backend, mock_pm
+    ):
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "• Working (3s • esc to interrupt)"
+        mock_get_backend.return_value = backend
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        backend.get_history.assert_called_once_with(
+            "s1", "w1", strip_escapes=True, visible_only=True
+        )
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_ready_terminal_is_rehydrated_after_confirmation(
+        self, mock_get_backend, mock_pm
+    ):
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "› Ask Codex to do anything"
+        mock_get_backend.return_value = backend
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+
+        assert sm.get_status("t1") == TerminalStatus.UNKNOWN
+        assert "t1" not in sm._last_status
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
 
 class TestGetStatusEventInbox:
     """Event-inbox backend (herdr): derive status on demand from the provider."""

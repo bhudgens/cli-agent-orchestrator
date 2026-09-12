@@ -736,6 +736,8 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
         line = text[m.start() : line_end]
         if re.match(MCP_TOOL_CALL_PATTERN, line):
             continue
+        if re.search(TUI_PROGRESS_PATTERN, line):
+            continue
         return m
     return None
 
@@ -758,8 +760,12 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
 
     matches = []
     for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
-        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end(match.start())]):
-            matches.append(match)
+        line = text[match.start() : line_end(match.start())]
+        if re.match(MCP_TOOL_CALL_PATTERN, line):
+            continue
+        if re.search(TUI_PROGRESS_PATTERN, line):
+            continue
+        matches.append(match)
 
     if not matches:
         return None
@@ -1605,6 +1611,11 @@ class CodexProvider(BaseProvider):
 
             response_text = clean_output[response_start:end_pos].strip()
 
+            if not asst_after_user and re.search(TUI_PROGRESS_PATTERN, response_text):
+                raise ValueError(
+                    "No Codex response found - only progress indicator after last user message"
+                )
+
             if response_text:
                 # Strip "assistant:" prefix if present (label format)
                 response_text = re.sub(
@@ -1617,8 +1628,8 @@ class CodexProvider(BaseProvider):
                 return response_text.strip()
 
         # Fallback: assistant marker based extraction (no user message found).
-        # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
-        # on the model's actual reply, not tool output.
+        # Filter out MCP tool calls and live TUI progress rows so we anchor on
+        # the model's actual reply, not tool output or an in-flight spinner.
         all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
@@ -1629,6 +1640,8 @@ class CodexProvider(BaseProvider):
                 line_end = len(clean_output)
             line = clean_output[m.start() : line_end]
             if re.match(MCP_TOOL_CALL_PATTERN, line):
+                continue
+            if re.search(TUI_PROGRESS_PATTERN, line):
                 continue
             matches.append(m)
 

@@ -1731,6 +1731,20 @@ class TestCodexProviderMessageExtraction:
         with pytest.raises(ValueError, match="No Codex response found"):
             provider.extract_last_message_from_script(output)
 
+    def test_extract_rejects_no_user_marker_live_spinner_footer(self):
+        output = (
+            "• Working (0s • esc to interrupt)\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol ultra · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        with pytest.raises(ValueError, match="No Codex response found"):
+            provider.extract_last_message_from_script(output)
+
     def test_extract_strips_cursor_and_erase_escapes(self):
         """PR #390: extraction must strip ALL terminal escapes, not just SGR
         colour codes. codex's TUI emits cursor-move (H) and erase (K) CSI
@@ -1761,6 +1775,22 @@ class TestCodexProviderMessageExtraction:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         with pytest.raises(ValueError, match="Empty Codex response"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_rejects_prompt_echo_with_live_working_spinner(self):
+        output = (
+            "› [CAO Handoff] SMOKE HANDOFF CWD DELIVERY.\n"
+            "\n"
+            "• Working (0s • esc to interrupt)\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol ultra · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        with pytest.raises(ValueError, match="No Codex response found"):
             provider.extract_last_message_from_script(output)
 
 
