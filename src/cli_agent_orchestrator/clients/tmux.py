@@ -1614,6 +1614,22 @@ class TmuxClient:
             f"({stderr or 'no error output'})"
         )
 
+    def get_pane_id(self, session_name: str, window_name: str) -> str:
+        """Read the exact active pane identity without changing tmux state."""
+        session = self._find_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        window = self._find_window(session, session_name, window_name)
+        if not window:
+            raise ValueError(f"Window '{window_name}' not found")
+        pane = self._find_active_pane(window, session_name, window_name)
+        if not pane:
+            raise ValueError("Active pane not found")
+        result = pane.cmd("display-message", "-p", "#{pane_id}")
+        if not result.stdout or not re.fullmatch(r"%[0-9]+", result.stdout[0].strip()):
+            raise TmuxLookupError("Unable to read a valid pane identity")
+        return result.stdout[0].strip()
+
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane.
 

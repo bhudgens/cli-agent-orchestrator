@@ -2479,7 +2479,8 @@ def adopt_terminal(
             )
         if (
             expected_pane_id is not None
-            and backend.get_pane_id(session_name, window_name) != expected_pane_id
+            and backend.get_pane_id(terminal_id, session_name=session_name, window_name=window_name)
+            != expected_pane_id
         ):
             raise TerminalAdoptionConflict("Live pane changed since recovery preview")
 

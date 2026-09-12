@@ -136,6 +136,9 @@ class TmuxBackend(TerminalBackend):
             visible_only=visible_only,
         )
 
+    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+        return self._client.get_pane_id(session_name, window_name)
+
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_working_directory(session_name, window_name)
 

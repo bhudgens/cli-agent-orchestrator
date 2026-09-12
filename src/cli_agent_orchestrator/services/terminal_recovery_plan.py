@@ -52,7 +52,7 @@ def _snapshot() -> dict[str, Any]:
                 entry["state"] = "ambiguous"
                 continue
             try:
-                entry["pane_id"] = backend.get_pane_id(session, name)
+                entry["pane_id"] = backend.get_pane_id("", session_name=session, window_name=name)
                 if not isinstance(entry["pane_id"], str) or not entry["pane_id"]:
                     raise ValueError("live pane identity is unavailable")
                 candidate, ambiguity = session_service._recovery_candidate_for_window(

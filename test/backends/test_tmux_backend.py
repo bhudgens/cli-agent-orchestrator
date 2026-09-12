@@ -50,6 +50,13 @@ class TestTmuxBackendDelegation:
     def backend(self, mock_client):
         return TmuxBackend(client=mock_client)
 
+    def test_recovery_reads_pane_identity(self, backend, mock_client):
+        mock_client.get_pane_id.return_value = "%123"
+        assert (
+            backend.get_pane_id("aabbccdd", session_name="cao-test", window_name="worker") == "%123"
+        )
+        mock_client.get_pane_id.assert_called_once_with("cao-test", "worker")
+
     def test_create_session_delegates(self, backend, mock_client):
         mock_client.create_session.return_value = "window-0"
         result = backend.create_session("cao-test", "window-0", "tid123", "/tmp")
